@@ -65,6 +65,30 @@ TEAM_TOTALS_BOOKS = [
 ]
 
 
+def split_row(book, spread=(0.30, 0.62), total=(0.55, 0.40), ml=(0.35, 0.60),
+              start="2026-11-05T00:30:00Z", event_id="nba_knicks_celtics_2026-11-04"):
+    """Build a SharpAPI splits row. Tuples are (away bets, away handle)."""
+    def blk(pair, a, b):
+        return {"bets_pct": {a: pair[0], b: 1 - pair[0]},
+                "handle_pct": {a: pair[1], b: 1 - pair[1]}}
+    return {
+        "event_id": event_id, "sportsbook": book, "league": "nba",
+        "away_team": "Boston Celtics", "home_team": "New York Knicks",
+        "spread": {"away_line": -3.5, "home_line": 3.5, **blk(spread, "away", "home")},
+        "total": {"line": 221.5, **blk(total, "over", "under")},
+        "moneyline": {"away_odds": -170, "home_odds": 145, **blk(ml, "away", "home")},
+        "fetched_at": "2026-11-04T17:00:00Z", "event_start_time": start,
+    }
+
+
+SPLITS_ROWS = [
+    split_row("circa", spread=(0.40, 0.70)),
+    split_row("draftkings"),
+    {**split_row("betmgm"), "event_id": "nba_other_game_2026-11-04",
+     "away_team": "Miami Heat", "home_team": "Chicago Bulls"},
+]
+
+
 def audit(**kw):
     base = dict(
         sport_name="NBA", market_type="spreads", line_val=-3.5, ticket_pct=30.0,
@@ -176,6 +200,90 @@ class TestHelpers(unittest.TestCase):
         self.assertIn("➖ N/A", set(df["Status"]))
 
 
+class TestSplits(unittest.TestCase):
+    def match(self, rows=SPLITS_ROWS):
+        return core.match_split_rows(rows, "Boston Celtics", "New York Knicks", GAME["commence_time"])
+
+    def test_team_matching(self):
+        self.assertEqual(core.team_match_score("Boston Celtics", "boston celtics"), 2)
+        self.assertEqual(core.team_match_score("LA Clippers", "Los Angeles Clippers"), 1)
+        self.assertEqual(core.team_match_score("LA Lakers", "LA Clippers"), 0)
+        self.assertEqual(core.team_match_score(None, "x"), 0)
+
+    def test_match_rows_picks_right_event(self):
+        rows = self.match()
+        self.assertEqual({r["sportsbook"] for r in rows}, {"circa", "draftkings"})
+
+    def test_match_requires_orientation(self):
+        self.assertEqual(core.match_split_rows(SPLITS_ROWS, "New York Knicks", "Boston Celtics", GAME["commence_time"]), [])
+
+    def test_doubleheader_uses_start_time(self):
+        g1 = split_row("draftkings", start="2026-11-05T00:30:00Z", event_id="g1")
+        g2 = split_row("draftkings", start="2026-11-05T04:00:00Z", event_id="g2")
+        got = core.match_split_rows([g1, g2], "Boston Celtics", "New York Knicks", "2026-11-05T04:05:00Z")
+        self.assertEqual(got[0]["event_id"], "g2")
+
+    def test_read_split_scales_and_prefers_draftkings(self):
+        r = core.read_split(self.match(), "spreads", "Boston Celtics", "Boston Celtics", "New York Knicks")
+        self.assertEqual((r.ticket_pct, r.handle_pct, r.source), (30.0, 62.0, "draftkings"))
+
+    def test_read_split_home_side_and_total_and_ml(self):
+        rows = self.match()
+        home = core.read_split(rows, "spreads", "New York Knicks", "Boston Celtics", "New York Knicks")
+        self.assertEqual((home.ticket_pct, home.handle_pct), (70.0, 38.0))
+        over = core.read_split(rows, "totals", "Over", "Boston Celtics", "New York Knicks")
+        self.assertEqual((over.ticket_pct, over.handle_pct), (55.0, 40.0))
+        ml = core.read_split(rows, "h2h", "New York Knicks", "Boston Celtics", "New York Knicks")
+        self.assertEqual((ml.ticket_pct, ml.handle_pct), (65.0, 40.0))
+
+    def test_unsupported_or_unmatched(self):
+        rows = self.match()
+        args = ("Boston Celtics", "New York Knicks")
+        self.assertIsNone(core.read_split(rows, "team_totals", "Over", *args))
+        self.assertIsNone(core.read_split(rows, "h2h", "Draw", *args))
+        self.assertIsNone(core.read_split(rows, "totals", "Push", *args))
+
+    def test_betmgm_only_has_no_handle_so_it_is_skipped(self):
+        mgm = split_row("betmgm")
+        mgm["spread"]["handle_pct"] = {"away": None, "home": None}
+        self.assertIsNone(core.read_split([mgm], "spreads", "Boston Celtics", "Boston Celtics", "New York Knicks"))
+        dk = split_row("draftkings")
+        r = core.read_split([mgm, dk], "spreads", "Boston Celtics", "Boston Celtics", "New York Knicks")
+        self.assertEqual(r.source, "draftkings")
+
+    def test_consensus_row_used_when_no_dk(self):
+        r = core.read_split([split_row("consensus")], "spreads", "Boston Celtics", "Boston Celtics", "New York Knicks")
+        self.assertEqual(r.source, "consensus")
+
+    @patch("auditor_core.requests.get")
+    def test_fetch_splits_header_params_pagination(self, get):
+        get.side_effect = [
+            resp(payload={"data": [SPLITS_ROWS[0]], "pagination": {"has_more": True, "next_offset": 200}}),
+            resp(payload={"data": [SPLITS_ROWS[1]], "pagination": {"has_more": False, "next_offset": None}}),
+        ]
+        rows = core.fetch_splits("nba", "SHARPKEY")
+        self.assertEqual(len(rows), 2)
+        first = get.call_args_list[0]
+        self.assertEqual(first.kwargs["headers"], {"X-API-Key": "SHARPKEY"})
+        self.assertEqual(first.kwargs["params"]["league"], "nba")
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["offset"], 200)
+
+    @patch("auditor_core.requests.get")
+    def test_fetch_splits_tier_error_nested_message(self, get):
+        get.return_value = resp(status=403, payload={"error": {"code": "tier_restricted", "message": "Requires Pro tier"}})
+        with self.assertRaisesRegex(core.SharpAPIError, "SharpAPI error \\(403\\).*Pro tier"):
+            core.fetch_splits("nba", "k")
+
+    @patch("auditor_core.requests.get", side_effect=requests.ConnectionError("down"))
+    def test_fetch_splits_network(self, _):
+        with self.assertRaises(core.SharpAPIError):
+            core.fetch_splits("nba", "k")
+
+    def test_every_league_has_splits_slug(self):
+        for name, cfg in core.SPORT_CONFIG.items():
+            self.assertTrue(cfg.splits_league, name)
+
+
 def resp(status=200, payload=None, headers=None, text="", json_raises=False):
     m = MagicMock()
     m.status_code = status
@@ -237,11 +345,12 @@ class TestApiLayer(unittest.TestCase):
 class FakeSt(types.ModuleType):
     """Minimal recording stand-in for streamlit (real Streamlit isn't installed here)."""
 
-    def __init__(self, picks=None, key="KEY"):
+    def __init__(self, picks=None, key="KEY", sharp_key="SHARP", checks=None):
         super().__init__("streamlit")
         self.calls: list[tuple[str, tuple, dict]] = []
         self.picks = picks or {}
-        self.key = key
+        self.keys = {"The Odds API Key": key, "SharpAPI Key": sharp_key}
+        self.checks = checks or {}
         self.sidebar = MagicMock()
         self.secrets = {}
 
@@ -259,7 +368,10 @@ class FakeSt(types.ModuleType):
         return opts[labels.index(want)] if want else opts[0]
 
     def text_input(self, label, value="", **k):
-        return self.key
+        return self.keys[label] or value
+
+    def expander(self, *a, **k):
+        return MagicMock()
 
     def slider(self, label, min_value=0, max_value=1, value=0, **k):
         return value
@@ -268,7 +380,7 @@ class FakeSt(types.ModuleType):
         return value
 
     def checkbox(self, label, **k):
-        return False
+        return self.checks.get(label, False)
 
     def columns(self, spec, **k):
         n = spec if isinstance(spec, int) else len(spec)
@@ -280,8 +392,8 @@ class FakeSt(types.ModuleType):
         return lambda *a, **k: self._rec(name, *a, **k)
 
 
-def run_app(picks=None, key="KEY", get_side_effect=None):
-    fake = FakeSt(picks, key)
+def run_app(picks=None, key="KEY", get_side_effect=None, sharp_key="SHARP", checks=None):
+    fake = FakeSt(picks, key, sharp_key, checks)
     sys.modules["streamlit"] = fake
     sys.modules.pop("app", None)
     import app  # noqa: WPS433
@@ -291,7 +403,9 @@ def run_app(picks=None, key="KEY", get_side_effect=None):
     return fake
 
 
-def router(url, params=None, timeout=None):
+def router(url, params=None, timeout=None, headers=None):
+    if "sharpapi.io" in url:
+        return resp(payload={"data": SPLITS_ROWS, "pagination": {"has_more": False, "next_offset": None}})
     if url.endswith("/odds/") or url.endswith("/odds"):
         if "/events/" in url:
             return resp(payload={"bookmakers": TEAM_TOTALS_BOOKS})
@@ -326,6 +440,60 @@ class TestUiSmoke(unittest.TestCase):
         self.assertIn("table", self.names(fake))
         labels = [c for c in fake.calls if c[0] == "selectbox" and c[1][0] == "Select Specific Selection"]
         self.assertTrue(labels[0][1][1][0].startswith("Boston Celtics Over 112.5"))
+
+    def test_splits_come_from_sharpapi(self):
+        fake = run_app(get_side_effect=router)
+        metrics = [c for c in fake.calls if c[0] == "metric"]
+        self.assertEqual(metrics[1][2]["value"], "62% Handle")
+        self.assertIn("30% bets", metrics[1][2]["label"])
+        self.assertEqual(metrics[1][2]["delta"], "+32.0% vs Public Bets")
+        captions = [c[1][0] for c in fake.calls if c[0] == "caption"]
+        self.assertTrue(any("draftkings" in t and "SharpAPI" in t for t in captions))
+        self.assertNotIn("warning", self.names(fake))
+
+    def test_splits_follow_selection(self):
+        fake = run_app(
+            picks={"Select Specific Selection": "New York Knicks 3.5 (-110)"},
+            get_side_effect=router,
+        )
+        metrics = [c for c in fake.calls if c[0] == "metric"]
+        self.assertEqual(metrics[1][2]["value"], "38% Handle")
+
+    def test_no_sharp_key_falls_back_to_manual(self):
+        fake = run_app(sharp_key="", get_side_effect=lambda url, **k: router(url, **k))
+        # text_input falls back to the widget default ("" here) -> manual sliders (30/85)
+        metrics = [c for c in fake.calls if c[0] == "metric"]
+        self.assertEqual(metrics[1][2]["value"], "85% Handle")
+        self.assertIn("warning", self.names(fake))
+
+    def test_sharp_plan_error_falls_back_but_app_still_works(self):
+        def route(url, **k):
+            if "sharpapi.io" in url:
+                return resp(status=403, payload={"error": {"message": "Requires Pro tier"}})
+            return router(url, **k)
+        fake = run_app(get_side_effect=route)
+        warns = [c[1][0] for c in fake.calls if c[0] == "warning"]
+        self.assertTrue(any("Pro tier" in w for w in warns))
+        metrics = [c for c in fake.calls if c[0] == "metric"]
+        self.assertEqual(metrics[1][2]["value"], "85% Handle")
+        self.assertIn("table", self.names(fake))
+
+    def test_force_manual_skips_sharpapi(self):
+        calls = []
+        def route(url, **k):
+            calls.append(url)
+            return router(url, **k)
+        run_app(get_side_effect=route, checks={"Always use manual splits": True})
+        self.assertFalse(any("sharpapi.io" in u for u in calls))
+
+    def test_team_totals_uses_manual_splits(self):
+        fake = run_app(
+            picks={"Select Market Type": "team_totals (extra API credit)"},
+            get_side_effect=router,
+        )
+        metrics = [c for c in fake.calls if c[0] == "metric"]
+        self.assertEqual(metrics[1][2]["value"], "85% Handle")
+        self.assertIn("warning", self.names(fake))
 
     def test_missing_key_warns(self):
         fake = run_app(key="")
