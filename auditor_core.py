@@ -11,6 +11,9 @@ Model (all thresholds are module constants):
     key number = min_k | |line| - k | <= tolerance   (spreads only)
     verdict    = whale and (criteria passed) >= MIN_CRITERIA_FOR_SHARP
 
+Splits (SharpAPI /api/v1/splits): bets_pct and handle_pct arrive as 0.0-1.0 per
+side; they are scaled to 0-100 and fed into `gap = handle% - ticket%`.
+
 Line-movement sign convention (from the selected side's perspective):
     negative = market moved TOWARD this selection (price/spread got more expensive)
     positive = market moved AWAY from this selection
@@ -18,6 +21,7 @@ Line-movement sign convention (from the selected side's perspective):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -31,6 +35,10 @@ REQUEST_TIMEOUT_S = 15
 FEATURED_MARKETS = ("spreads", "totals", "h2h")
 EVENT_ONLY_MARKETS = ("team_totals",)  # not allowed on the bulk /odds endpoint
 PREFERRED_BOOK = "draftkings"
+SHARP_BASE_URL = "https://api.sharpapi.io/api/v1"
+SPLITS_PAGE_LIMIT = 200
+SPLITS_MAX_PAGES = 5
+SPLIT_BOOK_PRIORITY = ("draftkings", "consensus", "circa", "betmgm")
 DISPLAY_TZ = "America/New_York"
 
 # --- Model thresholds --------------------------------------------------------
@@ -50,30 +58,37 @@ class SportConfig:
     key_numbers: tuple[float, ...]
     kind: str
     key_tolerance: float = 0.0  # 0.5 = "on the key or a half-point hook"
+    splits_league: str = ""  # SharpAPI league slug
 
+
+_SOCCER_KEYS = (0.25, 0.5, 0.75, 1.25, 1.5)
 
 SPORT_CONFIG: dict[str, SportConfig] = {
-    "NBA": SportConfig("basketball_nba", (3, 4, 5, 7, 10), "basketball", 0.5),
+    "NBA": SportConfig("basketball_nba", (3, 4, 5, 7, 10), "basketball", 0.5, "nba"),
     "NFL": SportConfig(
-        "americanfootball_nfl", (3, 7, 6, 10, 4, 14, 17, 21), "football", 0.5
+        "americanfootball_nfl", (3, 7, 6, 10, 4, 14, 17, 21), "football", 0.5, "nfl"
     ),
-    "MLB": SportConfig("baseball_mlb", (1.5,), "baseball", 0.0),
-    "NHL": SportConfig("icehockey_nhl", (1.5,), "hockey", 0.0),
+    "MLB": SportConfig("baseball_mlb", (1.5,), "baseball", 0.0, "mlb"),
+    "NHL": SportConfig("icehockey_nhl", (1.5,), "hockey", 0.0, "nhl"),
     "NCAA Football": SportConfig(
-        "americanfootball_ncaaf", (3, 7, 10, 6, 14, 21, 24), "football", 0.5
+        "americanfootball_ncaaf", (3, 7, 10, 6, 14, 21, 24), "football", 0.5, "ncaaf"
     ),
     "NCAA Basketball": SportConfig(
-        "basketball_ncaab", (3, 4, 5, 7, 10), "basketball", 0.5
+        "basketball_ncaab", (3, 4, 5, 7, 10), "basketball", 0.5, "ncaab"
     ),
-    "EPL": SportConfig("soccer_epl", (0.25, 0.5, 0.75, 1.25, 1.5), "soccer"),
+    "EPL": SportConfig(
+        "soccer_epl", _SOCCER_KEYS, "soccer", 0.0, "england_-_premier_league"
+    ),
     "UCL": SportConfig(
-        "soccer_uefa_champs_league", (0.25, 0.5, 0.75, 1.25, 1.5), "soccer"
+        "soccer_uefa_champs_league", _SOCCER_KEYS, "soccer", 0.0,
+        "uefa_-_champions_league",
     ),
     "Bundesliga": SportConfig(
-        "soccer_germany_bundesliga", (0.25, 0.5, 0.75, 1.25, 1.5), "soccer"
+        "soccer_germany_bundesliga", _SOCCER_KEYS, "soccer", 0.0,
+        "germany_-_bundesliga",
     ),
     "La Liga": SportConfig(
-        "soccer_spain_la_liga", (0.25, 0.5, 0.75, 1.25, 1.5), "soccer"
+        "soccer_spain_la_liga", _SOCCER_KEYS, "soccer", 0.0, "spain_-_la_liga"
     ),
 }
 
@@ -88,35 +103,64 @@ CHECK_LABELS: dict[str, str] = {
 
 
 # --- Odds API client ---------------------------------------------------------
-class OddsAPIError(Exception):
+class APIError(Exception):
+    """Base class for upstream API failures."""
+
+
+class OddsAPIError(APIError):
     """Raised for any failure talking to The Odds API."""
 
 
-def _request(url: str, params: Mapping[str, Any]) -> tuple[Any, Optional[str]]:
+class SharpAPIError(APIError):
+    """Raised for any failure talking to SharpAPI."""
+
+
+def _error_message(resp: Any) -> Optional[str]:
+    """Extract a message from either {"message": ..} or {"error": {"message": ..}}."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    err = body.get("error")
+    if isinstance(err, dict) and err.get("message"):
+        return str(err["message"])
+    return body.get("message") or (err if isinstance(err, str) else None)
+
+
+def _request(
+    url: str,
+    params: Mapping[str, Any],
+    headers: Optional[Mapping[str, str]] = None,
+    error_cls: type[APIError] = OddsAPIError,
+    service: str = "The Odds API",
+) -> tuple[Any, Optional[str]]:
     """GET `url` and return (parsed JSON, remaining-credits header).
 
     Raises:
-        OddsAPIError: on network failure, non-200 status, or invalid JSON.
+        error_cls: on network failure, non-200 status, or invalid JSON.
     """
     try:
-        resp = requests.get(url, params=dict(params), timeout=REQUEST_TIMEOUT_S)
+        resp = requests.get(
+            url,
+            params=dict(params),
+            headers=dict(headers) if headers else None,
+            timeout=REQUEST_TIMEOUT_S,
+        )
     except requests.RequestException as exc:
-        raise OddsAPIError(f"Could not reach The Odds API: {exc}") from exc
+        raise error_cls(f"Could not reach {service}: {exc}") from exc
 
     if resp.status_code != 200:
-        try:
-            body = resp.json()
-            msg = body.get("message") if isinstance(body, dict) else None
-        except ValueError:
-            msg = None
-        raise OddsAPIError(
-            f"API error ({resp.status_code}): "
-            f"{msg or (resp.text or '')[:200] or 'check API key / quota.'}"
+        msg = _error_message(resp)
+        raise error_cls(
+            f"{service} error ({resp.status_code}): "
+            f"{msg or (resp.text or '')[:200] or 'check API key / plan / quota.'}"
         )
     try:
         return resp.json(), resp.headers.get("x-requests-remaining")
     except ValueError as exc:
-        raise OddsAPIError("The Odds API returned invalid JSON.") from exc
+        raise error_cls(f"{service} returned invalid JSON.") from exc
 
 
 def fetch_featured_odds(
@@ -157,6 +201,145 @@ def fetch_event_market(
     if not isinstance(data, dict):
         raise OddsAPIError("Unexpected response shape from The Odds API.")
     return data.get("bookmakers", []), remaining
+
+
+# --- SharpAPI splits ---------------------------------------------------------
+def fetch_splits(league: str, sharp_key: str) -> list[dict[str, Any]]:
+    """Fetch every splits row (all sources) for a SharpAPI league slug.
+
+    Requires a SharpAPI plan that includes /splits (Pro tier or higher).
+
+    Raises:
+        SharpAPIError: on any failure (including 401/403 plan errors).
+    """
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    for _ in range(SPLITS_MAX_PAGES):
+        data, _ = _request(
+            f"{SHARP_BASE_URL}/splits",
+            {"league": league, "limit": SPLITS_PAGE_LIMIT, "offset": offset},
+            headers={"X-API-Key": sharp_key},
+            error_cls=SharpAPIError,
+            service="SharpAPI",
+        )
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise SharpAPIError("Unexpected response shape from SharpAPI.")
+        rows.extend(data["data"])
+        page = data.get("pagination") or {}
+        if not page.get("has_more") or page.get("next_offset") is None:
+            break
+        offset = int(page["next_offset"])
+    return rows
+
+
+@dataclass(frozen=True)
+class SplitReading:
+    """Ticket and handle share (0-100) for one selection."""
+
+    ticket_pct: float
+    handle_pct: float
+    source: str
+    fetched_at: Optional[str]
+
+
+def _norm(name: Any) -> str:
+    """Lowercase alphanumeric-only form of a team name."""
+    return re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+
+
+def team_match_score(a: Any, b: Any) -> int:
+    """2 = same name, 1 = same nickname (last word), 0 = no match."""
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return 0
+    if na == nb:
+        return 2
+    return int(na.split()[-1] == nb.split()[-1])
+
+
+def _start_gap_s(row: Mapping[str, Any], commence_iso: str) -> float:
+    """Seconds between a row's event start and the game's start (huge if unknown)."""
+    start = row.get("event_start_time")
+    if not start:
+        return 1e12
+    try:
+        delta = pd.to_datetime(start, utc=True) - pd.to_datetime(commence_iso, utc=True)
+        return abs(delta.total_seconds())
+    except (ValueError, TypeError):
+        return 1e12
+
+
+def match_split_rows(
+    rows: Sequence[Mapping[str, Any]], away: str, home: str, commence_iso: str
+) -> list[Mapping[str, Any]]:
+    """Return all source rows for the SharpAPI event that matches this game."""
+    scored = []
+    for r in rows:
+        s_away = team_match_score(r.get("away_team"), away)
+        s_home = team_match_score(r.get("home_team"), home)
+        if s_away and s_home:
+            scored.append((s_away + s_home, -_start_gap_s(r, commence_iso), r))
+    if not scored:
+        return []
+    best = max(scored, key=lambda t: (t[0], t[1]))
+    best_id = best[2].get("event_id")
+    return [r for _, _, r in scored if r.get("event_id") == best_id]
+
+
+def _selection_side(
+    market_type: str, selection: str, away: str, home: str
+) -> Optional[str]:
+    """Map an Odds API selection to a SharpAPI side key."""
+    if market_type == "totals":
+        side = str(selection).strip().lower()
+        return side if side in ("over", "under") else None
+    s_away = team_match_score(selection, away)
+    s_home = team_match_score(selection, home)
+    if s_away == s_home:
+        return None  # no match, or ambiguous (also covers soccer "Draw")
+    return "away" if s_away > s_home else "home"
+
+
+def _scaled(block: Mapping[str, Any], metric: str, side: str) -> Optional[float]:
+    """Read block[metric][side] (0-1) as a 0-100 percentage, or None."""
+    value = (block.get(metric) or {}).get(side)
+    return None if value is None else float(value) * 100.0
+
+
+def read_split(
+    event_rows: Sequence[Mapping[str, Any]],
+    market_type: str,
+    selection: str,
+    away: str,
+    home: str,
+    preferred: str = PREFERRED_BOOK,
+) -> Optional[SplitReading]:
+    """Pick the best source row that has BOTH ticket and handle for the selection.
+
+    Returns None for unsupported markets (e.g. team_totals), unmatched
+    selections, or when no source publishes both numbers.
+    """
+    market_key = {"spreads": "spread", "h2h": "moneyline", "totals": "total"}.get(
+        market_type
+    )
+    side = _selection_side(market_type, selection, away, home)
+    if market_key is None or side is None:
+        return None
+
+    order = (preferred, *[b for b in SPLIT_BOOK_PRIORITY if b != preferred])
+    rank = {b: i for i, b in enumerate(order)}
+    for row in sorted(event_rows, key=lambda r: rank.get(r.get("sportsbook"), 99)):
+        block = row.get(market_key) or {}
+        tickets = _scaled(block, "bets_pct", side)
+        handle = _scaled(block, "handle_pct", side)
+        if tickets is not None and handle is not None:
+            return SplitReading(
+                ticket_pct=round(tickets, 1),
+                handle_pct=round(handle, 1),
+                source=str(row.get("sportsbook", "unknown")),
+                fetched_at=row.get("fetched_at"),
+            )
+    return None
 
 
 # --- Feed helpers ------------------------------------------------------------
