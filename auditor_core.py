@@ -22,7 +22,7 @@ Line-movement sign convention (from the selected side's perspective):
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
@@ -59,11 +59,13 @@ class SportConfig:
     kind: str
     key_tolerance: float = 0.0  # 0.5 = "on the key or a half-point hook"
     splits_league: str = ""  # SharpAPI league slug
+    dk_label: str = ""  # league label on the DraftKings Network splits page
+    dk_event_group: int = 0  # that page's tb_eg id (0 = league not published)
 
 
 _SOCCER_KEYS = (0.25, 0.5, 0.75, 1.25, 1.5)
 
-SPORT_CONFIG: dict[str, SportConfig] = {
+_BASE_CONFIG: dict[str, SportConfig] = {
     "NBA": SportConfig("basketball_nba", (3, 4, 5, 7, 10), "basketball", 0.5, "nba"),
     "NFL": SportConfig(
         "americanfootball_nfl", (3, 7, 6, 10, 4, 14, 17, 21), "football", 0.5, "nfl"
@@ -90,6 +92,30 @@ SPORT_CONFIG: dict[str, SportConfig] = {
     "La Liga": SportConfig(
         "soccer_spain_la_liga", _SOCCER_KEYS, "soccer", 0.0, "spain_-_la_liga"
     ),
+}
+
+# League -> (label, tb_eg id) on dknetwork.draftkings.com betting-splits page.
+# NFL's 88808 is confirmed from the page's own links; the others are the matching
+# DraftKings sportsbook league ids and are re-discovered from the page at runtime
+# when it exposes them. Bundesliga / La Liga are not offered on that page.
+_DK_PAGE_GROUPS: dict[str, tuple[str, int]] = {
+    "NFL": ("NFL", 88808),
+    "NBA": ("NBA", 42648),
+    "MLB": ("MLB", 84240),
+    "NHL": ("NHL", 42133),
+    "NCAA Football": ("NCAA Football", 87637),
+    "NCAA Basketball": ("NCAA Basketball", 92483),
+    "EPL": ("England Premier League", 40253),
+    "UCL": ("Champions League", 40685),
+}
+
+SPORT_CONFIG: dict[str, SportConfig] = {
+    name: replace(
+        cfg,
+        dk_label=_DK_PAGE_GROUPS.get(name, ("", 0))[0],
+        dk_event_group=_DK_PAGE_GROUPS.get(name, ("", 0))[1],
+    )
+    for name, cfg in _BASE_CONFIG.items()
 }
 
 CHECK_LABELS: dict[str, str] = {
@@ -248,11 +274,14 @@ def _norm(name: Any) -> str:
 
 
 def team_match_score(a: Any, b: Any) -> int:
-    """2 = same name, 1 = same nickname (last word), 0 = no match."""
+    """2 = same name or nickname suffix, 1 = same last word, 0 = no match."""
     na, nb = _norm(a), _norm(b)
     if not na or not nb:
         return 0
     if na == nb:
+        return 2
+    short, long_ = sorted((na.split(), nb.split()), key=len)
+    if long_[-len(short):] == short:  # "bears" vs "chicago bears"
         return 2
     return int(na.split()[-1] == nb.split()[-1])
 
