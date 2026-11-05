@@ -1,14 +1,7 @@
 """Universal Sharp & Whale Action Auditor: Streamlit UI.
 
 Run with:  streamlit run app.py
-Requires auditor_core.py and dk_splits.py in the same folder.
-
-Splits default to the free DraftKings Network page (no key needed); SharpAPI is an
-optional alternative if your plan includes /splits.
-Keys are loaded automatically on open (first match wins):
-    1. .streamlit/secrets.toml  (ODDS_API_KEY / SHARP_API_KEY)
-    2. environment variables    (ODDS_API_KEY / SHARP_API_KEY)
-The sidebar key boxes are optional overrides.
+Requires auditor_core.py, dk_splits.py, and playerprops_splits.py in the same folder.
 """
 
 from __future__ import annotations
@@ -20,18 +13,17 @@ from typing import Any, Optional
 import streamlit as st
 
 from dk_splits import DKSplitsError, fetch_dk_splits
+from playerprops_splits import PlayerPropsSplitsError, fetch_playerprops_splits
 from auditor_core import (
     EVENT_ONLY_MARKETS,
     FEATURED_MARKETS,
     SPORT_CONFIG,
     OddsAPIError,
-    SharpAPIError,
     SplitReading,
     audit_market,
     checklist_table,
     fetch_event_market,
     fetch_featured_odds,
-    fetch_splits,
     format_price,
     game_label,
     market_outcomes,
@@ -41,20 +33,17 @@ from auditor_core import (
     read_split,
 )
 
-# --- Theme palette (swap these to restyle the whole app) ---------------------
 WHITE = "#FFFFFF"
-EMERALD = "#047857"        # body text on white (contrast ~5.5:1)
-EMERALD_DEEP = "#065F46"   # alerts / emphasis on pale green
-EMERALD_LIGHT = "#34D399"  # text on onyx surfaces (contrast ~9:1)
-ONYX = "#0F0F0F"           # highlight surfaces: inputs, table header, accents
-MINT = "#ECFDF5"           # soft hover / card tint
+EMERALD = "#047857"
+EMERALD_DEEP = "#065F46"
+EMERALD_LIGHT = "#34D399"
+ONYX = "#0F0F0F"
+MINT = "#ECFDF5"
 
 
 def build_css() -> str:
-    """Return the global stylesheet: white page, emerald text, onyx highlights."""
     return f"""
 <style>
-/* Page + sidebar + top bar: force light surfaces regardless of system theme */
 .stApp, [data-testid="stAppViewContainer"], .main,
 [data-testid="stSidebar"], [data-testid="stHeader"] {{
     background-color: {WHITE} !important;
@@ -62,7 +51,6 @@ def build_css() -> str:
 [data-testid="stSidebar"] {{ border-right: 2px solid {ONYX}; }}
 [data-testid="stHeader"] * {{ color: {ONYX} !important; fill: {ONYX} !important; }}
 
-/* Emerald text everywhere on white */
 .stApp, .stApp p, .stApp span, .stApp label, .stApp li, .stApp small,
 .stApp h1, .stApp h2, .stApp h3, .stApp h4,
 [data-testid="stWidgetLabel"] *, [data-testid="stCaptionContainer"] *,
@@ -72,7 +60,6 @@ def build_css() -> str:
 }}
 .stApp h1, .stApp h2, .stApp h3 {{ color: {EMERALD_DEEP} !important; }}
 
-/* Onyx inputs / dropdowns with light-emerald text */
 .stApp [data-baseweb="select"] > div,
 .stApp [data-baseweb="input"] > div,
 .stApp [data-baseweb="base-input"],
@@ -89,7 +76,6 @@ def build_css() -> str:
     color: {EMERALD_LIGHT} !important;
     fill: {EMERALD_LIGHT} !important;
 }}
-/* Open dropdown list */
 [data-baseweb="popover"] ul, [data-baseweb="popover"] li,
 [data-baseweb="menu"], [data-baseweb="menu"] li {{
     background-color: {ONYX} !important;
@@ -100,7 +86,6 @@ def build_css() -> str:
     color: {WHITE} !important;
 }}
 
-/* Sliders, checkboxes, expanders */
 [data-testid="stSlider"] [role="slider"] {{ background-color: {ONYX} !important; }}
 [data-testid="stSliderThumbValue"], [data-testid="stSliderThumbValue"] * {{
     color: {ONYX} !important;
@@ -110,19 +95,16 @@ def build_css() -> str:
 }}
 [data-testid="stExpander"] summary * {{ color: {EMERALD} !important; }}
 
-/* Alerts: pale mint card, onyx edge, readable emerald text */
 [data-testid="stAlert"] {{
     background-color: {MINT} !important; border-left: 5px solid {ONYX} !important;
 }}
 [data-testid="stAlert"] * {{ color: {EMERALD_DEEP} !important; }}
 
-/* Metric cards with an onyx highlight bar */
 [data-testid="stMetric"] {{
     background: {MINT}; border-left: 5px solid {ONYX};
     padding: 0.6rem 0.9rem; border-radius: 4px;
 }}
 
-/* Checklist table: onyx header, emerald rows */
 [data-testid="stTable"] table {{ border-collapse: collapse; width: 100%; }}
 [data-testid="stTable"] th, [data-testid="stTable"] th * {{
     background-color: {ONYX} !important; color: {WHITE} !important;
@@ -138,14 +120,11 @@ def build_css() -> str:
 CSS = build_css()
 
 SRC_DK = "DraftKings Network (free)"
-SRC_SHARP = "SharpAPI (Pro plan)"
-
+SRC_PLAYERPROPS = "PlayerProps.ai (free)"
 
 
 @dataclass(frozen=True)
 class ManualInputs:
-    """Sidebar inputs: manual split fallback plus timing flags."""
-
     ticket_pct: float
     handle_pct: float
     force_manual: bool
@@ -154,12 +133,10 @@ class ManualInputs:
     is_closing_window: bool
 
 
-# --- Cached API wrappers (exceptions are NOT cached by Streamlit) -------------
 @st.cache_data(ttl=600, show_spinner="Pulling live odds...")
 def cached_featured(
     sport_api_key: str, api_key: str
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
-    """Cached bulk odds pull (10 min)."""
     return fetch_featured_odds(sport_api_key, api_key)
 
 
@@ -167,40 +144,34 @@ def cached_featured(
 def cached_event_market(
     sport_api_key: str, event_id: str, api_key: str, market: str
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
-    """Cached single-event market pull (costs extra API credits)."""
     return fetch_event_market(sport_api_key, event_id, api_key, market)
 
 
-@st.cache_data(ttl=300, show_spinner="Pulling handle / bet splits...")
-def cached_splits(league: str, sharp_key: str) -> list[dict[str, Any]]:
-    """Cached SharpAPI splits pull (source refreshes about every 5 minutes)."""
-    return fetch_splits(league, sharp_key)
+@st.cache_data(ttl=300, show_spinner="Pulling PlayerProps.ai handle / bet splits...")
+def cached_playerprops_splits(league: str) -> list[dict[str, Any]]:
+    return fetch_playerprops_splits(league)
 
 
 @st.cache_data(ttl=300, show_spinner="Pulling DraftKings handle / bet splits...")
 def cached_dk_splits(label: str, event_group: int) -> list[dict[str, Any]]:
-    """Cached DraftKings Network splits pull (page refreshes every few minutes)."""
     return fetch_dk_splits(label, event_group)
 
 
 def load_secret(name: str) -> str:
-    """Read a key from Streamlit secrets, then the environment, else ''."""
     try:
         value = st.secrets.get(name, "")
-    except Exception:  # no secrets.toml configured
+    except Exception:
         value = ""
     return str(value or os.environ.get(name, ""))
 
 
-def render_sidebar() -> tuple[str, str, str, str, ManualInputs]:
-    """Draw the sidebar; return (league, odds key, sharp key, splits source, manual)."""
+def render_sidebar() -> tuple[str, str, str, ManualInputs]:
     odds_default = load_secret("ODDS_API_KEY")
-    sharp_default = load_secret("SHARP_API_KEY")
 
     with st.sidebar:
         st.header("⚙️ Configuration & Feed")
         league = st.selectbox("Select League / Sport", list(SPORT_CONFIG.keys()))
-        source = st.selectbox("Splits source", [SRC_DK, SRC_SHARP])
+        source = st.selectbox("Splits source", [SRC_DK, SRC_PLAYERPROPS])
 
         with st.expander("🔑 API keys", expanded=not odds_default):
             st.caption(
@@ -209,9 +180,6 @@ def render_sidebar() -> tuple[str, str, str, str, ManualInputs]:
             )
             odds_key = st.text_input(
                 "The Odds API Key", value=odds_default, type="password"
-            )
-            sharp_key = st.text_input(
-                "SharpAPI Key (optional)", value=sharp_default, type="password"
             )
 
         st.divider()
@@ -240,7 +208,6 @@ def render_sidebar() -> tuple[str, str, str, str, ManualInputs]:
     return (
         league,
         odds_key,
-        sharp_key,
         source,
         ManualInputs(
             ticket_pct, handle_pct, force_manual, line_movement,
@@ -250,37 +217,28 @@ def render_sidebar() -> tuple[str, str, str, str, ManualInputs]:
 
 
 def market_label(market: str) -> str:
-    """Selector label; flags markets that cost an extra API call."""
     return f"{market} (extra API credit)" if market in EVENT_ONLY_MARKETS else market
 
 
 def resolve_splits(
     league: str,
     source: str,
-    sharp_key: str,
     game: dict[str, Any],
     market_type: str,
     selection: str,
 ) -> tuple[Optional[SplitReading], str]:
-    """Look up live splits for the chosen selection from the chosen source.
-
-    Returns:
-        (reading or None, human-readable status for the caption)
-    """
     cfg = SPORT_CONFIG[league]
-    if source == SRC_SHARP:
-        if not sharp_key:
-            return None, "No SharpAPI key set: using manual splits."
+    if source == SRC_PLAYERPROPS:
         try:
-            rows = cached_splits(cfg.splits_league, sharp_key)
-        except SharpAPIError as exc:
-            return None, f"SharpAPI unavailable ({exc}). Using manual splits."
-        label = "SharpAPI"
+            rows = cached_playerprops_splits(league)
+        except PlayerPropsSplitsError as exc:
+            return None, f"PlayerProps.ai splits unavailable ({exc}). Using manual splits."
+        label = "PlayerProps.ai"
     else:
         try:
             rows = cached_dk_splits(cfg.dk_label, cfg.dk_event_group)
         except DKSplitsError as exc:
-            return None, f"DraftKings Network splits unavailable ({exc}) Using manual splits."
+            return None, f"DraftKings Network splits unavailable ({exc}). Using manual splits."
         label = "DraftKings Network"
 
     event_rows = match_split_rows(
@@ -304,7 +262,6 @@ def resolve_splits(
 
 
 def main() -> None:
-    """Page entry point."""
     st.set_page_config(
         page_title="Universal Sharp & Whale Action Auditor",
         page_icon="⚡",
@@ -314,10 +271,10 @@ def main() -> None:
     st.title("⚡ Universal Sharp & Whale Action Auditor")
     st.markdown(
         "Live odds from **The Odds API** plus handle / bet splits from "
-        "**DraftKings Network** (or SharpAPI), scored on a 6-point whale checklist."
+        "**DraftKings Network** or **PlayerProps.ai**, scored on a 6-point whale checklist."
     )
 
-    league, odds_key, sharp_key, source, manual = render_sidebar()
+    league, odds_key, source, manual = render_sidebar()
     cfg = SPORT_CONFIG[league]
 
     if not odds_key:
@@ -389,13 +346,12 @@ def main() -> None:
     line_val = chosen.get("point")
     odds_price = chosen.get("price")
 
-    # --- Splits: SharpAPI first, manual sliders as fallback / override ---------
     reading: Optional[SplitReading] = None
     if manual.force_manual:
         status = "Splits: **manual** (override on)."
     else:
         reading, status = resolve_splits(
-            league, source, sharp_key, game, market_type, chosen["name"]
+            league, source, game, market_type, chosen["name"]
         )
     ticket_pct = reading.ticket_pct if reading else manual.ticket_pct
     handle_pct = reading.handle_pct if reading else manual.handle_pct
