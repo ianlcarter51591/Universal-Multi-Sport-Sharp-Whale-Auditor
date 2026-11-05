@@ -1,17 +1,6 @@
 """Free handle / bets splits from the DraftKings Network public splits page.
 
 Source: https://dknetwork.draftkings.com/draftkings-sportsbook-betting-splits/
-The page lists, per game, Odds / Handle % / Bets % for Moneyline, Spread and
-Total (all jurisdictions combined; the site refreshes it every few minutes).
-
-Parsing is deliberately DOM-agnostic: the HTML is flattened to a stream of text
-tokens and read with anchors that survive markup changes:
-    game header  -> "AWAY @ HOME" immediately before a "Sun 11/8 · 4:05 PM ET" line
-    market block -> "Moneyline" | "Spread" | "Total"
-    selection    -> <name> <odds> <handle%> <bets%>      (column order on the page)
-
-Rows are returned in the same shape as SharpAPI /splits rows (percentages as
-0-1 fractions), so `match_split_rows` / `read_split` work on either source.
 """
 
 from __future__ import annotations
@@ -40,7 +29,7 @@ DK_HEADERS = {
 }
 
 _DATE_RE = re.compile(
-    r"^[A-Za-z]{3,9},?\s+(\d{1,2})/(\d{1,2})\s*[·•|\-–]\s*"
+    r"^(?:[A-Za-z]{3,9},?\s+)?(\d{1,2})/(\d{1,2})\s*[·•|\-–]\s*"
     r"(\d{1,2}):(\d{2})\s*([AP]M)\b",
     re.IGNORECASE,
 )
@@ -96,13 +85,15 @@ def _norm_sign(text: str) -> str:
 
 
 def strip_abbrev(name: str) -> str:
-    """'CHI Bears' -> 'Bears', 'NY Jets' -> 'Jets'; leave single words alone."""
-    parts = name.split()
-    return " ".join(parts[1:]) if len(parts) > 1 and _ABBREV_RE.match(parts[0]) else name
+    """Strip location prefixes, rankings like '(1)', and gender tags like '[W]'."""
+    clean = re.sub(r"^\(\d+\)\s*", "", name)
+    clean = re.sub(r"\s*\[[WM]\]$", "", clean)
+    parts = clean.split()
+    return " ".join(parts[1:]) if len(parts) > 1 and _ABBREV_RE.match(parts[0]) else clean
 
 
 def parse_start(label: str, now: Optional[datetime] = None) -> Optional[str]:
-    """Turn 'Sun 11/8 · 4:05 PM ET' into a UTC ISO string (year inferred)."""
+    """Turn 'Sun 11/8 · 4:05 PM ET' or '11/8 · 4:05 PM ET' into a UTC ISO string."""
     m = _DATE_RE.match(label)
     if not m:
         return None
@@ -116,7 +107,7 @@ def parse_start(label: str, now: Optional[datetime] = None) -> Optional[str]:
         )
     except ValueError:
         return None
-    if (pd.Timestamp(now, tz=DISPLAY_TZ) - ts).days > 180:  # Dec page showing Jan games
+    if (pd.Timestamp(now, tz=DISPLAY_TZ) - ts).days > 180:
         ts = ts.replace(year=ts.year + 1)
     return ts.tz_convert("UTC").isoformat()
 
@@ -125,7 +116,6 @@ def _header_teams(tokens: list[str], date_idx: int) -> Optional[tuple[str, str]]
     """Find 'AWAY @ HOME' in the few tokens right before a date line."""
     for start in range(date_idx - 1, max(date_idx - 5, -1), -1):
         if "@" in tokens[start]:
-            # "@" can be its own text node: the away team is then the previous node
             first = start - 1 if tokens[start].lstrip().startswith("@") and start else start
             joined = " ".join(tokens[first:date_idx])
             away, _, home = joined.partition("@")
@@ -172,7 +162,7 @@ def _build_row(
     updated: Optional[str],
     now: Optional[datetime],
 ) -> Optional[dict[str, Any]]:
-    """Convert one game's parsed entries into a SharpAPI-style splits row."""
+    """Convert one game's parsed entries into a standardized splits row."""
     away, home = strip_abbrev(away_raw), strip_abbrev(home_raw)
     start_iso = parse_start(start_label, now)
     row: dict[str, Any] = {
@@ -219,7 +209,7 @@ def _build_row(
 
 
 def parse_dk_html(html: str, now: Optional[datetime] = None) -> list[dict[str, Any]]:
-    """Parse one page of the splits table into SharpAPI-style rows."""
+    """Parse one page of the splits table into standardized rows."""
     tokens = html_tokens(html)
     updated = next(
         (t.split(None, 1)[1] for t in tokens if t.lower().startswith("updated ")), None
@@ -240,12 +230,24 @@ def parse_dk_html(html: str, now: Optional[datetime] = None) -> list[dict[str, A
 
 
 def discover_event_groups(html: str) -> dict[str, int]:
-    """Map lower-cased league label -> tb_eg id from any links on the page."""
+    """Map lower-cased league label / alias -> tb_eg id from any links on the page."""
     found: dict[str, int] = {}
     for pattern, eg_first in zip(_EG_PATTERNS, (True, False)):
         for a, b in pattern.findall(html):
             eg, label = (a, b) if eg_first else (b, a)
-            found[unquote_plus(label).strip().lower()] = int(eg)
+            lbl = unquote_plus(label).strip().lower()
+            val = int(eg)
+            found[lbl] = val
+            if lbl in ("cfb", "ncaaf", "ncaa football"):
+                found["cfb"] = val
+                found["ncaa football"] = val
+            elif lbl in ("cbb", "ncaab", "ncaa basketball"):
+                found["cbb"] = val
+                found["ncaa basketball"] = val
+            elif lbl in ("nfl", "american football"):
+                found["nfl"] = val
+            elif lbl in ("nba", "basketball"):
+                found["nba"] = val
     return found
 
 
@@ -270,15 +272,7 @@ def _get(params: Optional[Mapping[str, Any]] = None) -> str:
 def fetch_dk_splits(
     label: str, fallback_eg: int, now: Optional[datetime] = None
 ) -> list[dict[str, Any]]:
-    """Fetch every page of splits for one league (next 7 days, all markets).
-
-    Args:
-        label: league label used by the site (e.g. "NBA", "England Premier League").
-        fallback_eg: tb_eg id used if the page doesn't expose one for `label`.
-
-    Raises:
-        DKSplitsError: league not published, request failure, or nothing parsable.
-    """
+    """Fetch every page of splits for one league."""
     if not label and not fallback_eg:
         raise DKSplitsError("DraftKings Network does not publish splits for this league.")
     eg = discover_event_groups(_get()).get(label.lower(), fallback_eg)
@@ -298,7 +292,6 @@ def fetch_dk_splits(
         page += 1
     if not rows:
         raise DKSplitsError(
-            "No games could be read from the DraftKings Network page "
-            "(it may be JavaScript-rendered, the league id may be wrong, or the layout changed)."
+            "No games could be read from the DraftKings Network page."
         )
     return rows
