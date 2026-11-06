@@ -503,6 +503,28 @@ class TestDkOtherSports(unittest.TestCase):
                 '<a href="?x=1&tb_eg=87637&y=2">NCAA Football</a>')
         self.assertEqual(dk.discover_event_groups(html), {"nhl": 42133, "mlb": 84240, "ncaa football": 87637})
 
+    def test_markup_clue_prefers_the_sports_dropdown_over_nav(self):
+        html = ('<nav><a href="/sport/nba/">NBA</a></nav><p>' + 'filler ' * 120 + '</p>'
+                '<ul><li data-eg="42648">NBA</li><li data-eg="42133">NHL</li><li data-eg="84240">MLB</li></ul>')
+        self.assertIn("data-eg=\"42648\"", dk.markup_clue(html, "NBA"))
+        self.assertNotIn("/sport/nba/", dk.markup_clue(html, "NBA"))
+
+    def test_coverage_report_mixes_ok_and_failures(self):
+        ok = dk.DKResult(rows=[{"away_team": "Bruins", "home_team": "Rangers"}],
+                         report=dk.DKReport("NHL", ((42133, "configured", 1),), ""))
+        def fake(label, eg):
+            if label == "NHL":
+                return ok
+            if not label:
+                raise dk.DKSplitsError("DraftKings Network does not publish splits for this league.")
+            raise dk.DKSplitsError("No games could be read", dk.DKReport(label, ((eg, "configured", 0),), ""))
+        df = dk.coverage_report({"NHL": ("NHL", 42133), "MLB": ("MLB", 84240), "La Liga": ("", 0)}, fetch=fake)
+        self.assertEqual(list(df["Games"]), [1, 0, 0])
+        self.assertEqual(df.loc[0, "First game"], "Bruins @ Rangers")
+        self.assertEqual(df.loc[1, "League id(s) tried"], "84240")
+        self.assertEqual(df.loc[0, "Status"], "OK")
+        self.assertIn("does not publish", df.loc[2, "Status"])
+
     def test_markup_clue_and_describe(self):
         html = '<ul><li data-x="1">NHL</li></ul>'
         self.assertIn("NHL", dk.markup_clue(html, "NHL"))
