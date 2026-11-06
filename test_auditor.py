@@ -390,6 +390,62 @@ class TestDkParser(unittest.TestCase):
         self.assertEqual(ev2[0]["away_team"], "Jets")
 
 
+COLLEGE_GAME = dk_game_html(
+    "Northeastern", "Virginia", "Fri 11/6 · 5:00 PM ET",
+    ml=[("Virginia", "−2500", 90, 80), ("Northeastern", "+1100", 10, 20)],
+    spread=[("Virginia -15.5", "−110", 55, 60), ("Northeastern +15.5", "−110", 45, 40)],
+    total=[("Over 160.5", "−115", 70, 35), ("Under 160.5", "−105", 30, 65)], line=160.5)
+COLLEGE_OTHER = dk_game_html(
+    "Virginia Tech", "SMU", "Fri 11/6 · 8:00 PM ET",
+    ml=[("SMU", "−200", 60, 55), ("Virginia Tech", "+170", 40, 45)],
+    spread=[("SMU -4.5", "−110", 50, 50), ("Virginia Tech +4.5", "−110", 50, 50)],
+    total=[("Over 150.5", "−110", 50, 50), ("Under 150.5", "−110", 50, 50)], line=150.5)
+COLLEGE_ABBREV = dk_game_html(
+    "UNC Wilmington", "Michigan St", "Fri 11/6 · 7:00 PM ET",
+    ml=[("Michigan St", "−900", 85, 90), ("UNC Wilmington", "+600", 15, 10)],
+    spread=[("Michigan St -12.5", "−110", 52, 58), ("UNC Wilmington +12.5", "−110", 48, 42)],
+    total=[("Over 140.5", "−110", 40, 45), ("Under 140.5", "−110", 60, 55)], line=140.5)
+
+
+class TestCollegeNames(unittest.TestCase):
+    """DraftKings lists college teams as bare school names (no nickname)."""
+
+    def rows(self):
+        return dk.parse_dk_html(dk_page(COLLEGE_GAME, COLLEGE_OTHER, COLLEGE_ABBREV), NOW)
+
+    def test_school_name_matches_school_plus_nickname(self):
+        self.assertEqual(core.team_match_score("Virginia", "Virginia Cavaliers"), 2)
+        self.assertEqual(core.team_match_score("Northeastern", "Northeastern Huskies"), 2)
+        self.assertEqual(core.team_match_score("Arkansas-Pine Bluff", "Arkansas-Pine Bluff Golden Lions"), 1)
+        self.assertEqual(core.team_match_score("Texas Tech", "Texas Tech Red Raiders"), 1)
+        self.assertEqual(core.team_match_score("Michigan St", "Michigan State Spartans"), 2)
+        self.assertEqual(core.team_match_score("UConn", "Connecticut Huskies"), 2)
+        self.assertEqual(core.team_match_score("St John's", "Saint John's Red Storm"), 1)
+
+    def test_virginia_is_not_confused_with_virginia_tech(self):
+        self.assertLess(core.team_match_score("Virginia", "Virginia Tech Hokies"),
+                        core.team_match_score("Virginia", "Virginia Cavaliers"))
+        ev = core.match_split_rows(self.rows(), "Northeastern Huskies", "Virginia Cavaliers", "2026-11-06T22:00:00Z")
+        self.assertEqual([(r["away_team"], r["home_team"]) for r in ev], [("Northeastern", "Virginia")])
+        self.assertEqual(core.match_split_rows(self.rows(), "Virginia Tech Hokies", "SMU Mustangs", "2026-11-07T01:00:00Z")[0]["away_team"], "Virginia Tech")
+
+    def test_college_readings(self):
+        ev = core.match_split_rows(self.rows(), "Northeastern Huskies", "Virginia Cavaliers", "2026-11-06T22:00:00Z")
+        args = ("Northeastern Huskies", "Virginia Cavaliers")
+        sp = core.read_split(ev, "spreads", "Virginia Cavaliers", *args)
+        self.assertEqual((sp.ticket_pct, sp.handle_pct), (60.0, 55.0))
+        over = core.read_split(ev, "totals", "Over", *args)
+        self.assertEqual((over.ticket_pct, over.handle_pct), (35.0, 70.0))
+        ml = core.read_split(ev, "h2h", "Northeastern Huskies", *args)
+        self.assertEqual((ml.ticket_pct, ml.handle_pct), (20.0, 10.0))
+
+    def test_abbreviated_college_names_still_match_via_raw_name(self):
+        ev = core.match_split_rows(self.rows(), "UNC Wilmington Seahawks", "Michigan State Spartans", "2026-11-07T00:00:00Z")
+        self.assertEqual(len(ev), 1)
+        sp = core.read_split(ev, "spreads", "Michigan State Spartans", "UNC Wilmington Seahawks", "Michigan State Spartans")
+        self.assertEqual((sp.ticket_pct, sp.handle_pct), (58.0, 52.0))
+
+
 class TestDkFetch(unittest.TestCase):
     @patch("auditor_core.requests.get")
     def test_pagination_and_params(self, get):
