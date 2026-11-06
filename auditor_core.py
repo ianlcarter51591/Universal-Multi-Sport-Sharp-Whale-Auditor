@@ -1,24 +1,41 @@
-"""Core logic for the Universal Sharp & Whale Action Auditor."""
+"""Core logic for the Universal Sharp & Whale Action Auditor.
+
+Pure-Python / pandas / numpy / requests only (no Streamlit), so it can be unit
+tested without a running UI.
+
+Model (all thresholds are module constants):
+    gap        = handle% - ticket%                  -> whale if gap >= WHALE_GAP_PCT
+    RLM        = (tickets <= 30% and move < 0) or (tickets >= 70% and move > 0)
+    steam      = |move| >= STEAM_PTS
+    late limit = in closing window and |move| >= LATE_MOVE_PTS
+    key number = min_k | |line| - k | <= tolerance   (spreads only)
+    verdict    = whale and (criteria passed) >= MIN_CRITERIA_FOR_SHARP
+
+Splits (DraftKings Network page, see dk_splits.py): rows carry bets_pct / handle_pct
+as 0.0-1.0 per side; they are scaled to 0-100 and fed into `gap = handle% - ticket%`.
+
+Line-movement sign convention (from the selected side's perspective):
+    negative = market moved TOWARD this selection (price/spread got more expensive)
+    positive = market moved AWAY from this selection
+"""
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 import requests
 
-from playerprops_splits import PlayerPropsSplitsError, fetch_playerprops_splits
-
 # --- API constants -----------------------------------------------------------
 BASE_URL = "https://api.the-odds-api.com/v4/sports"
 REQUEST_TIMEOUT_S = 15
 FEATURED_MARKETS = ("spreads", "totals", "h2h")
-EVENT_ONLY_MARKETS = ("team_totals",)
+EVENT_ONLY_MARKETS = ("team_totals",)  # not allowed on the bulk /odds endpoint
 PREFERRED_BOOK = "draftkings"
-SPLIT_BOOK_PRIORITY = ("draftkings", "playerprops", "consensus", "circa", "betmgm")
+SPLIT_BOOK_PRIORITY = ("draftkings",)
 DISPLAY_TZ = "America/New_York"
 
 # --- Model thresholds --------------------------------------------------------
@@ -27,7 +44,7 @@ RLM_PUBLIC_LOW = 30.0
 RLM_PUBLIC_HIGH = 70.0
 STEAM_PTS = 1.0
 LATE_MOVE_PTS = 0.5
-MIN_CRITERIA_FOR_SHARP = 2
+MIN_CRITERIA_FOR_SHARP = 2  # whale divergence + at least one corroborating signal
 
 
 @dataclass(frozen=True)
@@ -37,52 +54,38 @@ class SportConfig:
     api_key: str
     key_numbers: tuple[float, ...]
     kind: str
-    key_tolerance: float = 0.0
-    dk_label: str = ""
-    dk_event_group: int = 0
+    key_tolerance: float = 0.0  # 0.5 = "on the key or a half-point hook"
+    dk_label: str = ""  # league label on the DraftKings Network splits page
+    dk_event_group: int = 0  # that page's tb_eg id (0 = league not published)
 
 
 _SOCCER_KEYS = (0.25, 0.5, 0.75, 1.25, 1.5)
 
-_BASE_CONFIG: dict[str, SportConfig] = {
-    "NBA": SportConfig("basketball_nba", (3, 4, 5, 7, 10), "basketball", 0.5),
+# dk_event_group: NFL's 88808 is confirmed from the page's own links; the rest are
+# DraftKings' league ids and are cross-checked against the page at runtime.
+# Bundesliga / La Liga are not offered on the DraftKings Network page.
+SPORT_CONFIG: dict[str, SportConfig] = {
+    "NBA": SportConfig("basketball_nba", (3, 4, 5, 7, 10), "basketball", 0.5, "NBA", 42648),
     "NFL": SportConfig(
-        "americanfootball_nfl", (3, 7, 6, 10, 4, 14, 17, 21), "football", 0.5
+        "americanfootball_nfl", (3, 7, 6, 10, 4, 14, 17, 21), "football", 0.5, "NFL", 88808
     ),
-    "MLB": SportConfig("baseball_mlb", (1.5,), "baseball", 0.0),
-    "NHL": SportConfig("icehockey_nhl", (1.5,), "hockey", 0.0),
+    "MLB": SportConfig("baseball_mlb", (1.5,), "baseball", 0.0, "MLB", 84240),
+    "NHL": SportConfig("icehockey_nhl", (1.5,), "hockey", 0.0, "NHL", 42133),
     "NCAA Football": SportConfig(
-        "americanfootball_ncaaf", (3, 7, 10, 6, 14, 21, 24), "football", 0.5
+        "americanfootball_ncaaf", (3, 7, 10, 6, 14, 21, 24), "football", 0.5,
+        "NCAA Football", 87637,
     ),
     "NCAA Basketball": SportConfig(
-        "basketball_ncaab", (3, 4, 5, 7, 10), "basketball", 0.5
+        "basketball_ncaab", (3, 4, 5, 7, 10), "basketball", 0.5, "NCAA Basketball", 92483
     ),
-    "EPL": SportConfig("soccer_epl", _SOCCER_KEYS, "soccer", 0.0),
-    "UCL": SportConfig("soccer_uefa_champs_league", _SOCCER_KEYS, "soccer", 0.0),
-    "Bundesliga": SportConfig("soccer_germany_bundesliga", _SOCCER_KEYS, "soccer", 0.0),
-    "La Liga": SportConfig("soccer_spain_la_liga", _SOCCER_KEYS, "soccer", 0.0),
-}
-
-_DK_PAGE_GROUPS: dict[str, tuple[str, int]] = {
-    "NFL": ("NFL", 88808),
-    "NBA": ("NBA", 42648),
-    "MLB": ("MLB", 84240),
-    "NHL": ("NHL", 42133),
-    "NCAA Football": ("CFB", 87637),
-    "NCAA Basketball": ("CBB", 92483),
-    "EPL": ("England Premier League", 40253),
-    "UCL": ("Champions League", 40685),
-    "Bundesliga": ("Bundesliga", 40400),
-    "La Liga": ("La Liga", 40380),
-}
-
-SPORT_CONFIG: dict[str, SportConfig] = {
-    name: replace(
-        cfg,
-        dk_label=_DK_PAGE_GROUPS.get(name, ("", 0))[0],
-        dk_event_group=_DK_PAGE_GROUPS.get(name, ("", 0))[1],
-    )
-    for name, cfg in _BASE_CONFIG.items()
+    "EPL": SportConfig(
+        "soccer_epl", _SOCCER_KEYS, "soccer", 0.0, "England Premier League", 40253
+    ),
+    "UCL": SportConfig(
+        "soccer_uefa_champs_league", _SOCCER_KEYS, "soccer", 0.0, "Champions League", 40685
+    ),
+    "Bundesliga": SportConfig("soccer_germany_bundesliga", _SOCCER_KEYS, "soccer"),
+    "La Liga": SportConfig("soccer_spain_la_liga", _SOCCER_KEYS, "soccer"),
 }
 
 CHECK_LABELS: dict[str, str] = {
@@ -95,6 +98,7 @@ CHECK_LABELS: dict[str, str] = {
 }
 
 
+# --- Odds API client ---------------------------------------------------------
 class APIError(Exception):
     """Base class for upstream API failures."""
 
@@ -104,6 +108,7 @@ class OddsAPIError(APIError):
 
 
 def _error_message(resp: Any) -> Optional[str]:
+    """Extract a message from either {"message": ..} or {"error": {"message": ..}}."""
     try:
         body = resp.json()
     except ValueError:
@@ -123,6 +128,11 @@ def _request(
     error_cls: type[APIError] = OddsAPIError,
     service: str = "The Odds API",
 ) -> tuple[Any, Optional[str]]:
+    """GET `url` and return (parsed JSON, remaining-credits header).
+
+    Raises:
+        error_cls: on network failure, non-200 status, or invalid JSON.
+    """
     try:
         resp = requests.get(
             url,
@@ -148,13 +158,14 @@ def _request(
 def fetch_featured_odds(
     sport_api_key: str, api_key: str
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Fetch spreads/totals/moneyline for every upcoming game in a sport."""
     data, remaining = _request(
         f"{BASE_URL}/{sport_api_key}/odds/",
         {
-            "apiKey": api_key,
+            "apiKey": api_key,  # NOTE: camelCase is required by the API
             "regions": "us",
             "markets": ",".join(FEATURED_MARKETS),
-            "oddsFormat": "american",
+            "oddsFormat": "american",  # NOTE: camelCase is required by the API
         },
     )
     if not isinstance(data, list):
@@ -165,6 +176,11 @@ def fetch_featured_odds(
 def fetch_event_market(
     sport_api_key: str, event_id: str, api_key: str, market: str
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Fetch one additional market (e.g. team_totals) for a single event.
+
+    Returns:
+        (bookmakers list, remaining credits)
+    """
     data, remaining = _request(
         f"{BASE_URL}/{sport_api_key}/events/{event_id}/odds",
         {
@@ -179,6 +195,7 @@ def fetch_event_market(
     return data.get("bookmakers", []), remaining
 
 
+# --- Splits matching (rows come from dk_splits.py) ---------------------------
 @dataclass(frozen=True)
 class SplitReading:
     """Ticket and handle share (0-100) for one selection."""
@@ -190,22 +207,25 @@ class SplitReading:
 
 
 def _norm(name: Any) -> str:
+    """Lowercase alphanumeric-only form of a team name."""
     return re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
 
 
 def team_match_score(a: Any, b: Any) -> int:
+    """2 = same name or nickname suffix, 1 = same last word, 0 = no match."""
     na, nb = _norm(a), _norm(b)
     if not na or not nb:
         return 0
     if na == nb:
         return 2
     short, long_ = sorted((na.split(), nb.split()), key=len)
-    if long_[-len(short):] == short:
+    if long_[-len(short):] == short:  # "bears" vs "chicago bears"
         return 2
     return int(na.split()[-1] == nb.split()[-1])
 
 
 def _start_gap_s(row: Mapping[str, Any], commence_iso: str) -> float:
+    """Seconds between a row's event start and the game's start (huge if unknown)."""
     start = row.get("event_start_time")
     if not start:
         return 1e12
@@ -219,6 +239,7 @@ def _start_gap_s(row: Mapping[str, Any], commence_iso: str) -> float:
 def match_split_rows(
     rows: Sequence[Mapping[str, Any]], away: str, home: str, commence_iso: str
 ) -> list[Mapping[str, Any]]:
+    """Return all source rows for the splits event that matches this game."""
     scored = []
     for r in rows:
         s_away = team_match_score(r.get("away_team"), away)
@@ -235,17 +256,21 @@ def match_split_rows(
 def _selection_side(
     market_type: str, selection: str, away: str, home: str
 ) -> Optional[str]:
+    """Map an Odds API selection to a splits side key (away/home/over/under)."""
     if market_type == "totals":
         side = str(selection).strip().lower()
         return side if side in ("over", "under") else None
+    if str(selection).strip().lower() == "draw":
+        return "draw"
     s_away = team_match_score(selection, away)
     s_home = team_match_score(selection, home)
     if s_away == s_home:
-        return None
+        return None  # no match, or ambiguous
     return "away" if s_away > s_home else "home"
 
 
 def _scaled(block: Mapping[str, Any], metric: str, side: str) -> Optional[float]:
+    """Read block[metric][side] (0-1) as a 0-100 percentage, or None."""
     value = (block.get(metric) or {}).get(side)
     return None if value is None else float(value) * 100.0
 
@@ -258,6 +283,11 @@ def read_split(
     home: str,
     preferred: str = PREFERRED_BOOK,
 ) -> Optional[SplitReading]:
+    """Pick the best source row that has BOTH ticket and handle for the selection.
+
+    Returns None for unsupported markets (e.g. team_totals), unmatched
+    selections, or when no source publishes both numbers.
+    """
     market_key = {"spreads": "spread", "h2h": "moneyline", "totals": "total"}.get(
         market_type
     )
@@ -281,9 +311,11 @@ def read_split(
     return None
 
 
+# --- Feed helpers ------------------------------------------------------------
 def pick_bookmaker(
     bookmakers: Sequence[Mapping[str, Any]], preferred: str = PREFERRED_BOOK
 ) -> Optional[Mapping[str, Any]]:
+    """Return the preferred bookmaker, else the first one, else None."""
     return next(
         (b for b in bookmakers if b.get("key") == preferred),
         bookmakers[0] if bookmakers else None,
@@ -291,10 +323,12 @@ def pick_bookmaker(
 
 
 def market_outcomes(book: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Map market key -> outcomes for a bookmaker payload."""
     return {m["key"]: m.get("outcomes", []) for m in book.get("markets", [])}
 
 
 def format_price(price: Any) -> str:
+    """Format an American price as +150 / -110; fall back to str()."""
     try:
         return f"{int(round(float(price))):+d}"
     except (TypeError, ValueError):
@@ -302,8 +336,9 @@ def format_price(price: Any) -> str:
 
 
 def outcome_label(outcome: Mapping[str, Any]) -> str:
+    """Human-readable label, including team for team totals."""
     parts = [
-        outcome.get("description"),
+        outcome.get("description"),  # team name on team_totals
         outcome.get("name"),
         outcome.get("point"),
     ]
@@ -312,19 +347,24 @@ def outcome_label(outcome: Mapping[str, Any]) -> str:
 
 
 def format_commence(commence_iso: str) -> str:
+    """Convert an ISO-8601 UTC timestamp to a US Eastern display string."""
     ts = pd.to_datetime(commence_iso, utc=True).tz_convert(DISPLAY_TZ)
     return ts.strftime("%a %b %d, %I:%M %p ET")
 
 
 def game_label(game: Mapping[str, Any]) -> str:
+    """Matchup label for the game selector."""
     return (
         f"{game['away_team']} @ {game['home_team']} "
         f"({format_commence(game['commence_time'])})"
     )
 
 
+# --- Audit logic -------------------------------------------------------------
 @dataclass(frozen=True)
 class AuditResult:
+    """Outcome of the checklist. `checks` value None means 'not applicable'."""
+
     is_sharp: bool
     passed: int
     applicable: int
@@ -334,6 +374,7 @@ class AuditResult:
 def key_number_hit(
     line: float, key_numbers: Sequence[float], tolerance: float
 ) -> bool:
+    """True if |line| is within `tolerance` of any key number (vectorized)."""
     keys = np.asarray(key_numbers, dtype=float)
     return bool(np.min(np.abs(keys - abs(float(line)))) <= tolerance + 1e-9)
 
@@ -348,6 +389,7 @@ def audit_market(
     is_opening_move: bool,
     is_closing_window: bool,
 ) -> AuditResult:
+    """Run the 6-point whale/sharp checklist for one selection."""
     cfg = SPORT_CONFIG[sport_name]
     gap = handle_pct - ticket_pct
     move = abs(line_movement)
@@ -358,7 +400,7 @@ def audit_market(
             line_val, cfg.key_numbers, cfg.key_tolerance
         )
     else:
-        key_check = None
+        key_check = None  # key numbers only describe point spreads
 
     checks: dict[str, Optional[bool]] = {
         "whale_divergence": bool(gap >= WHALE_GAP_PCT),
@@ -392,6 +434,7 @@ def checklist_table(
     is_opening_move: bool,
     is_closing_window: bool,
 ) -> pd.DataFrame:
+    """Build the display table for the checklist breakdown."""
     details = {
         "whale_divergence": (
             f"Handle ({handle_pct:.0f}%) vs Bets ({ticket_pct:.0f}%): "
