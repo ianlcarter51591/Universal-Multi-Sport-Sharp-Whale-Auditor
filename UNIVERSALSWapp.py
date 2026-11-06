@@ -29,6 +29,7 @@ from auditor_core import (
     checklist_table,
     fetch_event_market,
     fetch_featured_odds,
+    format_commence,
     format_price,
     game_label,
     market_outcomes,
@@ -263,10 +264,16 @@ def resolve_splits(
         rows, game["away_team"], game["home_team"], game["commence_time"]
     )
     if not event_rows:
+        wanted = f"{game['away_team']} @ {game['home_team']} ({format_commence(game['commence_time'])})"
+        listing = "\n".join(
+            f"  {r['away_team']} @ {r['home_team']}  {r.get('event_start_time', '?')}" for r in rows[:40]
+        )
+        diag += f"\nLooking for: {wanted}\nGames read from the page:\n{listing}"
+        span = f" The page covers {result.report.span}." if result.report.span else ""
         sample = "; ".join(f"{r['away_team']} @ {r['home_team']}" for r in rows[:3])
         return None, (
-            f"No DraftKings Network splits matched this game ({len(rows)} games read, "
-            f"e.g. {sample}). Using manual splits."
+            f"No DraftKings Network splits matched {wanted} ({len(rows)} games read, "
+            f"e.g. {sample}).{span} It may not be posted yet. Using manual splits."
         ), diag
     reading = read_split(
         event_rows, market_type, selection, game["away_team"], game["home_team"]
