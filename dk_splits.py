@@ -1,11 +1,24 @@
 """Free handle / bets splits from the DraftKings Network public splits page.
 
 Source: https://dknetwork.draftkings.com/draftkings-sportsbook-betting-splits/
+The page lists, per game, Odds / Handle % / Bets % for Moneyline, Spread and
+Total (all jurisdictions combined; the site refreshes it every few minutes).
+
+Parsing is deliberately DOM-agnostic: the HTML is flattened to a stream of text
+tokens and read with anchors that survive markup changes:
+    game header  -> "AWAY @ HOME" immediately before a "Sun 11/8 · 4:05 PM ET" line
+    market block -> "Moneyline" | "Spread" | "Total"
+    selection    -> <name> <odds> <handle%> <bets%>      (column order on the page)
+
+Rows use a common shape (percentages as
+0-1 fractions) consumed by `match_split_rows` / `read_split` in auditor_core.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any, Mapping, Optional
@@ -22,23 +35,37 @@ from auditor_core import (
 )
 
 DK_URL = "https://dknetwork.draftkings.com/draftkings-sportsbook-betting-splits/"
-DK_MAX_PAGES = 12
+DK_MAX_PAGES = 20
+DK_HORIZON_DAYS = 4  # stop paging once a page starts beyond this window
 DK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; SharpWhaleAuditor/1.0)",
     "Accept": "text/html,application/xhtml+xml",
 }
 
 _DATE_RE = re.compile(
-    r"^(?:[A-Za-z]{3,9},?\s+)?(\d{1,2})/(\d{1,2})\s*[·•|\-–]\s*"
+    r"^[A-Za-z]{3,9},?\s+(\d{1,2})/(\d{1,2})\s*[·•|\-–]\s*"
     r"(\d{1,2}):(\d{2})\s*([AP]M)\b",
     re.IGNORECASE,
 )
-_ODDS_RE = re.compile(r"^[+-]\d{2,5}$")
-_PCT_RE = re.compile(r"^(\d{1,3})%$")
+_ODDS_RE = re.compile(r"^(?:[+-]\d{2,5}|EVEN|EV)$", re.IGNORECASE)
+_PCT_RE = re.compile(r"^<?\s*(\d{1,3}(?:\.\d+)?)\s*%$")
 _SPREAD_RE = re.compile(r"^(.*?)\s*([+-]\d+(?:\.\d+)?)$")
 _TOTAL_RE = re.compile(r"^(over|under)\s+(\d+(?:\.\d+)?)$", re.IGNORECASE)
 _ABBREV_RE = re.compile(r"^[A-Z]{2,5}$")
-_MARKETS = {"moneyline": "moneyline", "spread": "spread", "total": "total"}
+# Heading text varies by sport ("Puck Line", "Run Line", "Match Result", ...).
+_MARKET_PATTERNS = (
+    ("moneyline", re.compile(r"^(money ?line|match (result|winner)|3-?way( money ?line| result)?|1x2)$", re.I)),
+    ("spread", re.compile(r"^((point |puck |run |goal )?(spread|line)|(.* )?handicap)$", re.I)),
+    ("total", re.compile(r"^(total( (points|goals|runs|games))?|over/under|game total)$", re.I)),
+)
+_MARKET_KEYS = tuple(k for k, _ in _MARKET_PATTERNS)
+_ID_RE = re.compile(r"(?<!\d)(\d{4,6})(?!\d)")
+_VOID_TAGS = {"img", "br", "hr", "input", "meta", "link", "source", "area", "base", "col", "embed", "param", "track", "wbr"}
+KNOWN_LABELS = (
+    "NFL", "NBA", "NHL", "MLB", "WNBA", "UFC", "UFL", "NCAA Football", "NCAA Basketball",
+    "NCAA Womens Basketball", "NCAA Baseball", "NCAA Ice Hockey", "England Premier League",
+    "Champions League", "Europa League", "MLS",
+)
 _EG_PATTERNS = (
     re.compile(r"tb_eg=(\d+)(?:&amp;|&)itm_content=([^&\"'\s<>]+)"),
     re.compile(r"itm_content=([^&\"'\s<>]+)(?:&amp;|&)[^\"'\s<>]*?tb_eg=(\d+)"),
@@ -47,6 +74,27 @@ _EG_PATTERNS = (
 
 class DKSplitsError(APIError):
     """Raised when the DraftKings Network page cannot be fetched or parsed."""
+
+    def __init__(self, message: str, report: Optional["DKReport"] = None) -> None:
+        super().__init__(message)
+        self.report = report
+
+
+@dataclass(frozen=True)
+class DKReport:
+    """What a fetch tried: (league id, origin, new games read) per attempt."""
+
+    label: str
+    attempts: tuple[tuple[int, str, int], ...]
+    clue: str
+
+
+@dataclass(frozen=True)
+class DKResult:
+    """Parsed rows plus the report describing how they were obtained."""
+
+    rows: list[dict[str, Any]]
+    report: DKReport
 
 
 class _TokenParser(HTMLParser):
@@ -85,15 +133,13 @@ def _norm_sign(text: str) -> str:
 
 
 def strip_abbrev(name: str) -> str:
-    """Strip location prefixes, rankings like '(1)', and gender tags like '[W]'."""
-    clean = re.sub(r"^\(\d+\)\s*", "", name)
-    clean = re.sub(r"\s*\[[WM]\]$", "", clean)
-    parts = clean.split()
-    return " ".join(parts[1:]) if len(parts) > 1 and _ABBREV_RE.match(parts[0]) else clean
+    """'CHI Bears' -> 'Bears', 'NY Jets' -> 'Jets'; leave single words alone."""
+    parts = name.split()
+    return " ".join(parts[1:]) if len(parts) > 1 and _ABBREV_RE.match(parts[0]) else name
 
 
 def parse_start(label: str, now: Optional[datetime] = None) -> Optional[str]:
-    """Turn 'Sun 11/8 · 4:05 PM ET' or '11/8 · 4:05 PM ET' into a UTC ISO string."""
+    """Turn 'Sun 11/8 · 4:05 PM ET' into a UTC ISO string (year inferred)."""
     m = _DATE_RE.match(label)
     if not m:
         return None
@@ -107,7 +153,7 @@ def parse_start(label: str, now: Optional[datetime] = None) -> Optional[str]:
         )
     except ValueError:
         return None
-    if (pd.Timestamp(now, tz=DISPLAY_TZ) - ts).days > 180:
+    if (pd.Timestamp(now, tz=DISPLAY_TZ) - ts).days > 180:  # Dec page showing Jan games
         ts = ts.replace(year=ts.year + 1)
     return ts.tz_convert("UTC").isoformat()
 
@@ -116,6 +162,7 @@ def _header_teams(tokens: list[str], date_idx: int) -> Optional[tuple[str, str]]
     """Find 'AWAY @ HOME' in the few tokens right before a date line."""
     for start in range(date_idx - 1, max(date_idx - 5, -1), -1):
         if "@" in tokens[start]:
+            # "@" can be its own text node: the away team is then the previous node
             first = start - 1 if tokens[start].lstrip().startswith("@") and start else start
             joined = " ".join(tokens[first:date_idx])
             away, _, home = joined.partition("@")
@@ -125,13 +172,19 @@ def _header_teams(tokens: list[str], date_idx: int) -> Optional[tuple[str, str]]
     return None
 
 
-def _read_entries(section: list[str]) -> dict[str, list[tuple[str, int, int]]]:
+def _market_key(token: str) -> Optional[str]:
+    """Normalise a market heading ('Puck Line' -> 'spread'), else None."""
+    text = token.strip()
+    return next((key for key, pat in _MARKET_PATTERNS if pat.match(text)), None)
+
+
+def _read_entries(section: list[str]) -> dict[str, list[tuple[str, float, float]]]:
     """Read (selection, handle%, bets%) triples under each market heading."""
-    entries: dict[str, list[tuple[str, int, int]]] = {k: [] for k in _MARKETS}
+    entries: dict[str, list[tuple[str, int, int]]] = {k: [] for k in _MARKET_KEYS}
     market: Optional[str] = None
     k = 0
     while k < len(section):
-        heading = _MARKETS.get(section[k].lower())
+        heading = _market_key(section[k])
         if heading:
             market, k = heading, k + 1
             continue
@@ -139,7 +192,7 @@ def _read_entries(section: list[str]) -> dict[str, list[tuple[str, int, int]]]:
             odds = _norm_sign(section[k + 1])
             handle, bets = _PCT_RE.match(section[k + 2]), _PCT_RE.match(section[k + 3])
             if _ODDS_RE.match(odds) and handle and bets:
-                entries[market].append((section[k], int(handle[1]), int(bets[1])))
+                entries[market].append((section[k], float(handle[1]), float(bets[1])))
                 k += 4
                 continue
         k += 1
@@ -147,7 +200,9 @@ def _read_entries(section: list[str]) -> dict[str, list[tuple[str, int, int]]]:
 
 
 def _side(name: str, away: str, home: str) -> Optional[str]:
-    """Which side ('away'/'home') a selection name belongs to."""
+    """Which side ('away'/'home'/'draw') a selection name belongs to."""
+    if name.strip().lower() == "draw":
+        return "draw"
     s_away, s_home = team_match_score(name, away), team_match_score(name, home)
     if s_away == s_home:
         return None
@@ -158,11 +213,11 @@ def _build_row(
     away_raw: str,
     home_raw: str,
     start_label: str,
-    entries: Mapping[str, list[tuple[str, int, int]]],
+    entries: Mapping[str, list[tuple[str, float, float]]],
     updated: Optional[str],
     now: Optional[datetime],
 ) -> Optional[dict[str, Any]]:
-    """Convert one game's parsed entries into a standardized splits row."""
+    """Convert one game's parsed entries into a splits row (0-1 fractions)."""
     away, home = strip_abbrev(away_raw), strip_abbrev(home_raw)
     start_iso = parse_start(start_label, now)
     row: dict[str, Any] = {
@@ -209,7 +264,7 @@ def _build_row(
 
 
 def parse_dk_html(html: str, now: Optional[datetime] = None) -> list[dict[str, Any]]:
-    """Parse one page of the splits table into standardized rows."""
+    """Parse one page of the splits table into splits rows."""
     tokens = html_tokens(html)
     updated = next(
         (t.split(None, 1)[1] for t in tokens if t.lower().startswith("updated ")), None
@@ -229,26 +284,75 @@ def parse_dk_html(html: str, now: Optional[datetime] = None) -> list[dict[str, A
     return rows
 
 
-def discover_event_groups(html: str) -> dict[str, int]:
-    """Map lower-cased league label / alias -> tb_eg id from any links on the page."""
+class _LabelIdParser(HTMLParser):
+    """Find numeric ids carried by the elements that wrap a league label.
+
+    Only `value`, `data-*` and `tb_eg=` inside links are trusted; `id` / `class`
+    are ignored because CMS menus put unrelated numbers there.
+    """
+
+    def __init__(self, labels: tuple[str, ...]) -> None:
+        super().__init__(convert_charrefs=True)
+        self.labels = {label.lower() for label in labels}
+        self.stack: list[list[int]] = []
+        self.found: dict[str, int] = {}
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in _VOID_TAGS:
+            return
+        ids: list[int] = []
+        for name, value in attrs:
+            if not value:
+                continue
+            if name in ("href", "data-href", "data-url"):
+                ids += [int(n) for n in re.findall(r"tb_eg=(\d+)", value)]
+            elif name == "value" or name.startswith("data-"):
+                ids += [int(n) for n in _ID_RE.findall(value)]
+        self.stack.append(ids)
+
+    def handle_startendtag(self, tag: str, attrs: list) -> None:
+        return  # self-closing tags never wrap text
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.stack and tag not in _VOID_TAGS:
+            self.stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        key = " ".join(data.split()).lower()
+        if key in self.labels and key not in self.found:
+            ids = next((i for i in reversed(self.stack[-3:]) if i), None)
+            if ids:
+                self.found[key] = ids[0]
+
+
+def discover_event_groups(html: str, labels: tuple[str, ...] = KNOWN_LABELS) -> dict[str, int]:
+    """Map lower-cased league label -> tb_eg id using links, then dropdown markup."""
     found: dict[str, int] = {}
     for pattern, eg_first in zip(_EG_PATTERNS, (True, False)):
         for a, b in pattern.findall(html):
             eg, label = (a, b) if eg_first else (b, a)
-            lbl = unquote_plus(label).strip().lower()
-            val = int(eg)
-            found[lbl] = val
-            if lbl in ("cfb", "ncaaf", "ncaa football"):
-                found["cfb"] = val
-                found["ncaa football"] = val
-            elif lbl in ("cbb", "ncaab", "ncaa basketball"):
-                found["cbb"] = val
-                found["ncaa basketball"] = val
-            elif lbl in ("nfl", "american football"):
-                found["nfl"] = val
-            elif lbl in ("nba", "basketball"):
-                found["nba"] = val
-    return found
+            found[unquote_plus(label).strip().lower()] = int(eg)
+    parser = _LabelIdParser(labels)
+    parser.feed(html)
+    return {**parser.found, **found}
+
+
+def markup_clue(html: str, label: str) -> str:
+    """Raw HTML around the first league-label occurrence (for diagnostics)."""
+    m = re.search(rf">\s*{re.escape(label)}\s*<", html, re.IGNORECASE)
+    if not m:
+        return "(league label not found in the raw HTML)"
+    return html[max(0, m.start() - 160): m.end() + 160]
+
+
+def describe_report(report: Optional[DKReport]) -> str:
+    """Plain-text summary of a fetch attempt for the diagnostics panel."""
+    if report is None:
+        return "No fetch report available."
+    lines = [f"League label: {report.label or '(none)'}"]
+    lines += [f"Tried league id {eg} ({origin}): {n} new games read" for eg, origin, n in report.attempts]
+    lines.append(f"Page markup near the league label:\n{report.clue}")
+    return "\n".join(lines)
 
 
 def total_pages(html: str) -> int:
@@ -269,15 +373,23 @@ def _get(params: Optional[Mapping[str, Any]] = None) -> str:
     return resp.text
 
 
-def fetch_dk_splits(
-    label: str, fallback_eg: int, now: Optional[datetime] = None
-) -> list[dict[str, Any]]:
-    """Fetch every page of splits for one league."""
-    if not label and not fallback_eg:
-        raise DKSplitsError("DraftKings Network does not publish splits for this league.")
-    eg = discover_event_groups(_get()).get(label.lower(), fallback_eg)
+def _beyond_horizon(rows: list[dict[str, Any]], now: datetime) -> bool:
+    """True if every dated row on a page starts after the paging horizon."""
+    starts = [pd.Timestamp(r["event_start_time"]) for r in rows if r.get("event_start_time")]
+    if not starts:
+        return False
+    cutoff = pd.Timestamp(now, tz=DISPLAY_TZ) + pd.Timedelta(days=DK_HORIZON_DAYS)
+    return min(starts) > cutoff
+
+
+def _fetch_group(label: str, eg: int, now: Optional[datetime], seen: set[str]) -> list[dict[str, Any]]:
+    """Read pages for one league id, skipping games already in `seen`.
+
+    Pages are chronological, so paging stops once a page starts beyond
+    DK_HORIZON_DAYS (busy college slates otherwise need dozens of requests).
+    """
+    now = now or datetime.now()
     rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
     page, last = 1, 1
     while page <= min(last, DK_MAX_PAGES):
         html = _get(
@@ -290,8 +402,48 @@ def fetch_dk_splits(
         seen.update(r["event_id"] for r in fresh)
         rows.extend(fresh)
         page += 1
+        if _beyond_horizon(fresh, now):
+            break
+    return rows
+
+
+def fetch_dk_splits(
+    label: str, fallback_eg: int, now: Optional[datetime] = None
+) -> DKResult:
+    """Fetch splits for one league (next 7 days, all markets).
+
+    The configured league id is tried first; any different id the page itself
+    exposes for `label` (links, dropdown values, data-* attributes) is tried as
+    well and the games are merged, so a wrong configured id still works.
+
+    Args:
+        label: league label used by the site (e.g. "NBA", "England Premier League").
+        fallback_eg: configured tb_eg id (0 = unknown, rely on discovery).
+
+    Raises:
+        DKSplitsError: league not published, request failure, or nothing parsable
+            (the exception carries a `report` of what was tried).
+    """
+    if not label and not fallback_eg:
+        raise DKSplitsError("DraftKings Network does not publish splits for this league.")
+    base_html = _get()
+    discovered = discover_event_groups(base_html).get(label.lower(), 0)
+    candidates = [(eg, origin) for eg, origin in ((fallback_eg, "configured"), (discovered, "discovered")) if eg]
+    candidates = [c for i, c in enumerate(candidates) if c[0] not in {x[0] for x in candidates[:i]}]
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    attempts: list[tuple[int, str, int]] = []
+    for eg, origin in candidates:
+        got = _fetch_group(label, eg, now, seen)
+        attempts.append((eg, origin, len(got)))
+        rows.extend(got)
+    report = DKReport(label=label, attempts=tuple(attempts), clue=markup_clue(base_html, label))
     if not rows:
         raise DKSplitsError(
-            "No games could be read from the DraftKings Network page."
+            "No games could be read from the DraftKings Network page "
+            f"for {label!r}: it may have no games in the next 7 days, the league id "
+            "may be wrong, or the layout changed.",
+            report,
         )
-    return rows
+    return DKResult(rows=rows, report=report)
