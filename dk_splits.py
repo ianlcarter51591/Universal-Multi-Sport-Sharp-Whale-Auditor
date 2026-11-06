@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 from urllib.parse import unquote_plus
 
 import pandas as pd
@@ -340,11 +340,21 @@ def discover_event_groups(html: str, labels: tuple[str, ...] = KNOWN_LABELS) -> 
 
 
 def markup_clue(html: str, label: str) -> str:
-    """Raw HTML around the first league-label occurrence (for diagnostics)."""
-    m = re.search(rf">\s*{re.escape(label)}\s*<", html, re.IGNORECASE)
-    if not m:
+    """Raw HTML around the league label, preferring the sports dropdown.
+
+    A label also appears in site navigation, so the occurrence that has other
+    league names nearby (the dropdown) is chosen over the first one.
+    """
+    hits = list(re.finditer(rf">\s*{re.escape(label)}\s*<", html, re.IGNORECASE))
+    if not hits:
         return "(league label not found in the raw HTML)"
-    return html[max(0, m.start() - 160): m.end() + 160]
+
+    def neighbours(m: "re.Match[str]") -> int:
+        window = html[max(0, m.start() - 400): m.end() + 400].lower()
+        return sum(k.lower() in window for k in KNOWN_LABELS if k.lower() != label.lower())
+
+    best = max(hits, key=lambda m: (neighbours(m) >= 2, -m.start()))
+    return html[max(0, best.start() - 200): best.end() + 200]
 
 
 def describe_report(report: Optional[DKReport]) -> str:
@@ -477,3 +487,40 @@ def fetch_dk_splits(
             report,
         )
     return DKResult(rows=rows, report=report)
+
+
+def coverage_report(
+    leagues: Mapping[str, tuple[str, int]],
+    fetch: Callable[[str, int], DKResult] = fetch_dk_splits,
+) -> pd.DataFrame:
+    """Try every league and summarise what the DraftKings page returned.
+
+    Args:
+        leagues: display name -> (site label, configured league id).
+        fetch: injectable fetcher (the app passes its cached one).
+
+    Returns:
+        One row per league: ids tried, games read, first matchup, status.
+    """
+    rows: list[dict[str, Any]] = []
+    for name, (label, eg) in leagues.items():
+        try:
+            res = fetch(label, eg)
+            first = res.rows[0]
+            rows.append({
+                "League": name,
+                "League id(s) tried": ", ".join(str(a[0]) for a in res.report.attempts),
+                "Games": len(res.rows),
+                "First game": f"{first['away_team']} @ {first['home_team']}",
+                "Status": "OK",
+            })
+        except DKSplitsError as exc:
+            attempts = exc.report.attempts if exc.report else ()
+            rows.append({
+                "League": name,
+                "League id(s) tried": ", ".join(str(a[0]) for a in attempts) or str(eg or "-"),
+                "Games": 0,
+                "First game": "",
+                "Status": str(exc)[:110],
+            })
+    return pd.DataFrame(rows)
