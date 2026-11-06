@@ -206,22 +206,42 @@ class SplitReading:
     fetched_at: Optional[str]
 
 
+_ALIASES = {"uconn": "connecticut", "umass": "massachusetts", "pitt": "pittsburgh"}
+
+
 def _norm(name: Any) -> str:
-    """Lowercase alphanumeric-only form of a team name."""
-    return re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+    """Lowercase alphanumeric-only form of a team name.
+
+    Also expands college shorthand: "St" -> "State" (or "Saint" when first),
+    plus a few common nicknames of schools (UConn, UMass, Pitt).
+    """
+    tokens = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).split()
+    tokens = [
+        ("saint" if i == 0 else "state") if t == "st" else _ALIASES.get(t, t)
+        for i, t in enumerate(tokens)
+    ]
+    return " ".join(tokens)
 
 
 def team_match_score(a: Any, b: Any) -> int:
-    """2 = same name or nickname suffix, 1 = same last word, 0 = no match."""
+    """Score how well two team names match.
+
+    2 = same name, nickname suffix ("Bears" / "Chicago Bears"), or school name plus
+        a one-word nickname ("Virginia" / "Virginia Cavaliers");
+    1 = school name plus a longer nickname ("Texas Tech" / "Texas Tech Red Raiders")
+        or the same last word;
+    0 = no match.
+    """
     na, nb = _norm(a), _norm(b)
     if not na or not nb:
         return 0
-    if na == nb:
+    ta, tb = na.split(), nb.split()
+    short, long_ = sorted((ta, tb), key=len)
+    if long_[-len(short):] == short:  # equal, or "bears" vs "chicago bears"
         return 2
-    short, long_ = sorted((na.split(), nb.split()), key=len)
-    if long_[-len(short):] == short:  # "bears" vs "chicago bears"
-        return 2
-    return int(na.split()[-1] == nb.split()[-1])
+    if long_[:len(short)] == short:  # DraftKings lists college teams without nicknames
+        return 2 if len(long_) - len(short) == 1 else 1
+    return int(ta[-1] == tb[-1])
 
 
 def _start_gap_s(row: Mapping[str, Any], commence_iso: str) -> float:
@@ -242,8 +262,8 @@ def match_split_rows(
     """Return all source rows for the splits event that matches this game."""
     scored = []
     for r in rows:
-        s_away = team_match_score(r.get("away_team"), away)
-        s_home = team_match_score(r.get("home_team"), home)
+        s_away = max(team_match_score(r.get(k), away) for k in ("away_team", "away_raw"))
+        s_home = max(team_match_score(r.get(k), home) for k in ("home_team", "home_raw"))
         if s_away and s_home:
             scored.append((s_away + s_home, -_start_gap_s(r, commence_iso), r))
     if not scored:
