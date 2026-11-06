@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any, Callable, Mapping, Optional
-from urllib.parse import unquote_plus
+from urllib.parse import parse_qs, unquote_plus, urlparse
 
 import pandas as pd
 import requests
@@ -36,6 +36,7 @@ from auditor_core import (
 
 DK_URL = "https://dknetwork.draftkings.com/draftkings-sportsbook-betting-splits/"
 DK_MAX_PAGES = 20
+DK_WINDOWS = ("today", "n7days")  # tb_edate values seen in the site's own URLs
 DK_HORIZON_DAYS = 4  # stop paging once a page starts beyond this window
 DK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; SharpWhaleAuditor/1.0)",
@@ -364,7 +365,7 @@ def describe_report(report: Optional[DKReport]) -> str:
     lines = [f"League label: {report.label or '(none)'}"]
     lines += [f"Tried league id {eg} ({origin}): {n} new games read" for eg, origin, n in report.attempts]
     if report.pages:
-        lines.append(f"Pages read: {report.pages}")
+        lines.append(f"Pages read: {report.pages} (date windows: {', '.join(DK_WINDOWS)})")
     if report.span:
         lines.append(f"Games on the page start between: {report.span}")
     lines.append(f"Page markup near the league label:\n{report.clue}")
@@ -401,31 +402,36 @@ def _beyond_horizon(rows: list[dict[str, Any]], now: datetime) -> bool:
 def _fetch_group(
     label: str, eg: int, now: Optional[datetime], seen: set[str]
 ) -> tuple[list[dict[str, Any]], int]:
-    """Read pages for one league id, skipping games already in `seen`.
+    """Read every date window and page for one league id, skipping games in `seen`.
 
-    Keeps requesting the next page until one yields no new games (pagination
-    links are not always present in the raw HTML). Pages are chronological, so it
-    also stops once a page starts beyond DK_HORIZON_DAYS.
+    The site's own links use ``tb_edate=today`` for some leagues and ``n7days``
+    for others, and a league can come back empty under one of them, so both
+    windows are read and merged. Within a window, pages are requested until one
+    yields nothing new (pagination links are not always in the raw HTML) or the
+    page starts beyond DK_HORIZON_DAYS.
 
     Returns:
         (new rows, number of pages that contained games)
     """
     now = now or _now_et()
     rows: list[dict[str, Any]] = []
-    page = 1
-    while page <= DK_MAX_PAGES:
-        html = _get(
-            {"tb_eg": eg, "itm_content": label, "tb_edate": "n7days", "tb_emt": "0", "tb_page": page}
-        )
-        fresh = [r for r in parse_dk_html(html, now) if r["event_id"] not in seen]
-        if not fresh:
-            break
-        seen.update(r["event_id"] for r in fresh)
-        rows.extend(fresh)
-        page += 1
-        if _beyond_horizon(fresh, now):
-            break
-    return rows, page - 1
+    pages = 0
+    for window in DK_WINDOWS:
+        page = 1
+        while page <= DK_MAX_PAGES:
+            html = _get(
+                {"tb_eg": eg, "itm_content": label, "tb_edate": window, "tb_emt": "0", "tb_page": page}
+            )
+            fresh = [r for r in parse_dk_html(html, now) if r["event_id"] not in seen]
+            if not fresh:
+                break
+            seen.update(r["event_id"] for r in fresh)
+            rows.extend(fresh)
+            pages += 1
+            page += 1
+            if _beyond_horizon(fresh, now):
+                break
+    return rows, pages
 
 
 def _now_et() -> datetime:
@@ -524,3 +530,28 @@ def coverage_report(
                 "Status": str(exc)[:110],
             })
     return pd.DataFrame(rows)
+
+
+def parse_dk_override(text: str, fallback_label: str = "") -> Optional[tuple[str, int]]:
+    """Read a league id the user copied from the DraftKings page.
+
+    Accepts the page URL after choosing the league in the site's dropdown
+    (``...?tb_eg=42133&itm_content=NHL&...``) or just the number.
+
+    Returns:
+        (label, tb_eg) or None if no id could be read.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return fallback_label, int(text)
+    query = parse_qs(urlparse(text).query)
+    eg = next((v for v in query.get("tb_eg", []) if v.isdigit()), None)
+    if eg is None:
+        m = re.search(r"tb_eg=(\d+)", text)  # tolerate pasted fragments
+        eg = m[1] if m else None
+    if eg is None:
+        return None
+    label = unquote_plus((query.get("itm_content") or [fallback_label])[0])
+    return label or fallback_label, int(eg)
