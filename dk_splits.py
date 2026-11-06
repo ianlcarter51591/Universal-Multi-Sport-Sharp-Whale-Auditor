@@ -228,6 +228,8 @@ def _build_row(
         "sportsbook": "draftkings",
         "away_team": away,
         "home_team": home,
+        "away_raw": away_raw,  # unstripped: college names like "UNC Wilmington"
+        "home_raw": home_raw,
         "fetched_at": updated,
     }
     if start_iso:
