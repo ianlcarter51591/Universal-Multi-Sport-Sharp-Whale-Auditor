@@ -402,13 +402,25 @@ class TestDkFetch(unittest.TestCase):
         res = dk.fetch_dk_splits("NFL", 88808, NOW)
         self.assertEqual(len(res.rows), 3)
         calls = [c.kwargs["params"] for c in get.call_args_list]
-        self.assertEqual([c.get("tb_page") for c in calls], [None, 1, 2, 3])  # page 3 probes for more
+        self.assertEqual([c.get("tb_page") for c in calls], [None, 1, 2, 3, 1])  # "today" window, then "n7days"
+        self.assertEqual([c.get("tb_edate") for c in calls[1:]], ["today"] * 3 + ["n7days"])
         self.assertEqual(res.report.pages, 2)
         self.assertIn("->", res.report.span)
         self.assertEqual(calls[1]["tb_eg"], 88808)
         self.assertEqual(calls[1]["tb_emt"], "0")
         self.assertIn("User-Agent", get.call_args.kwargs["headers"])
         self.assertEqual(res.report.attempts, ((88808, "configured", 3),))
+
+    @patch("auditor_core.requests.get")
+    def test_league_that_only_answers_under_one_date_window(self, get):
+        for only in ("today", "n7days"):
+            def fake(url, params=None, headers=None, timeout=None, only=only):
+                if not params:
+                    return resp(text="<html></html>")
+                return resp(text=dk_page(NFL_GAME_1) if params["tb_edate"] == only else dk_page())
+            get.side_effect = fake
+            res = dk.fetch_dk_splits("NHL", 42133, NOW)
+            self.assertEqual(len(res.rows), 1, only)
 
     @patch("auditor_core.requests.get")
     def test_discovered_id_is_tried_in_addition(self, get):
@@ -502,6 +514,15 @@ class TestDkOtherSports(unittest.TestCase):
                 '<select><option value="42133">NHL</option><option data-league-id="84240">MLB</option></select>'
                 '<a href="?x=1&tb_eg=87637&y=2">NCAA Football</a>')
         self.assertEqual(dk.discover_event_groups(html), {"nhl": 42133, "mlb": 84240, "ncaa football": 87637})
+
+    def test_parse_dk_override(self):
+        url = "https://dknetwork.draftkings.com/draftkings-sportsbook-betting-splits/?itm_content=NCAA+Football&tb_edate=n7days&tb_eg=87637"
+        self.assertEqual(dk.parse_dk_override(url, "x"), ("NCAA Football", 87637))
+        self.assertEqual(dk.parse_dk_override("?tb_eg=42133&itm_content=NHL", "x"), ("NHL", 42133))
+        self.assertEqual(dk.parse_dk_override(" 42133 ", "NHL"), ("NHL", 42133))
+        self.assertEqual(dk.parse_dk_override("...tb_eg=555", "NHL"), ("NHL", 555))
+        self.assertIsNone(dk.parse_dk_override("https://example.com/?x=1", "NHL"))
+        self.assertIsNone(dk.parse_dk_override("", "NHL"))
 
     def test_markup_clue_prefers_the_sports_dropdown_over_nav(self):
         html = ('<nav><a href="/sport/nba/">NBA</a></nav><p>' + 'filler ' * 120 + '</p>'
@@ -606,7 +627,8 @@ class FakeSt(types.ModuleType):
         super().__init__("streamlit")
         self.calls: list[tuple[str, tuple, dict]] = []
         self.picks = picks or {}
-        self.keys = {"The Odds API Key": key, "The Odds API Key (unused)": sharp_key}
+        self.keys = {"The Odds API Key": key, "The Odds API Key (unused)": sharp_key,
+                     "DraftKings page URL or tb_eg id (optional)": ""}
         self.checks = checks or {}
         self.sidebar = MagicMock()
         self.secrets = {}
@@ -649,8 +671,9 @@ class FakeSt(types.ModuleType):
         return lambda *a, **k: self._rec(name, *a, **k)
 
 
-def run_app(picks=None, key="KEY", get_side_effect=None, sharp_key="SHARP", checks=None):
+def run_app(picks=None, key="KEY", get_side_effect=None, sharp_key="SHARP", checks=None, dk_override=""):
     fake = FakeSt(picks, key, sharp_key, checks)
+    fake.keys["DraftKings page URL or tb_eg id (optional)"] = dk_override
     sys.modules["streamlit"] = fake
     sys.modules.pop("app", None)
     import app  # noqa: WPS433
@@ -816,6 +839,25 @@ class TestUiSmoke(unittest.TestCase):
         warns = [c[1][0] for c in fake.calls if c[0] == "warning"]
         self.assertTrue(any("Bears @ Seahawks" in w for w in warns))
         self.assertIn("code", [c[0] for c in fake.calls])
+
+    def test_dk_override_id_is_used_for_the_request(self):
+        seen = []
+        def route(url, params=None, **k):
+            if "dknetwork" in url and params:
+                seen.append(params)
+            return router(url, params=params, **k)
+        fake = run_app(get_side_effect=route,
+                       dk_override="https://x/?itm_content=NBA&tb_eg=55555")
+        self.assertTrue(seen and all(p["tb_eg"] == 55555 for p in seen))
+        metrics = [c for c in fake.calls if c[0] == "metric"]
+        self.assertEqual(metrics[1][2]["value"], "62% Handle")
+
+    def test_unreadable_dk_override_falls_back_with_message(self):
+        fake = run_app(get_side_effect=router, dk_override="not a url")
+        warns = [c[1][0] for c in fake.calls if c[0] == "warning"]
+        self.assertTrue(any("Could not find a tb_eg id" in w for w in warns))
+        metrics = [c for c in fake.calls if c[0] == "metric"]
+        self.assertEqual(metrics[1][2]["value"], "85% Handle")
 
     def test_missing_key_warns(self):
         fake = run_app(key="")
