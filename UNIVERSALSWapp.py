@@ -38,7 +38,13 @@ from auditor_core import (
     pick_bookmaker,
     read_split,
 )
-from dk_splits import DKResult, DKSplitsError, describe_report, fetch_dk_splits
+from dk_splits import (
+    DKResult,
+    DKSplitsError,
+    coverage_report,
+    describe_report,
+    fetch_dk_splits,
+)
 
 # --- Theme palette (swap these to restyle the whole app) ---------------------
 WHITE = "#FFFFFF"
@@ -303,6 +309,15 @@ def main() -> None:
 
     league, odds_key, manual = render_sidebar()
     cfg = SPORT_CONFIG[league]
+
+    with st.expander("🧪 DraftKings league coverage check"):
+        st.caption("Tries every league on the DraftKings Network page and shows what it returns.")
+        if st.button("Check every league"):
+            with st.spinner("Checking leagues..."):
+                st.table(coverage_report(
+                    {n: (c.dk_label, c.dk_event_group) for n, c in SPORT_CONFIG.items()},
+                    fetch=cached_dk_splits,
+                ))
 
     if not odds_key:
         st.warning(
