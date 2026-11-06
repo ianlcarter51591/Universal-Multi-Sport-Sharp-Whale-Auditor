@@ -397,12 +397,14 @@ class TestDkFetch(unittest.TestCase):
         def fake(url, params=None, headers=None, timeout=None):
             if not params:
                 return resp(text=dk_page(NFL_GAME_1, pages=1))
-            return resp(text=pages[params["tb_page"]])
+            return resp(text=pages.get(params["tb_page"], dk_page()))
         get.side_effect = fake
         res = dk.fetch_dk_splits("NFL", 88808, NOW)
         self.assertEqual(len(res.rows), 3)
         calls = [c.kwargs["params"] for c in get.call_args_list]
-        self.assertEqual([c.get("tb_page") for c in calls], [None, 1, 2])
+        self.assertEqual([c.get("tb_page") for c in calls], [None, 1, 2, 3])  # page 3 probes for more
+        self.assertEqual(res.report.pages, 2)
+        self.assertIn("->", res.report.span)
         self.assertEqual(calls[1]["tb_eg"], 88808)
         self.assertEqual(calls[1]["tb_emt"], "0")
         self.assertIn("User-Agent", get.call_args.kwargs["headers"])
