@@ -87,6 +87,8 @@ class DKReport:
     label: str
     attempts: tuple[tuple[int, str, int], ...]
     clue: str
+    pages: int = 0
+    span: str = ""
 
 
 @dataclass(frozen=True)
@@ -351,6 +353,10 @@ def describe_report(report: Optional[DKReport]) -> str:
         return "No fetch report available."
     lines = [f"League label: {report.label or '(none)'}"]
     lines += [f"Tried league id {eg} ({origin}): {n} new games read" for eg, origin, n in report.attempts]
+    if report.pages:
+        lines.append(f"Pages read: {report.pages}")
+    if report.span:
+        lines.append(f"Games on the page start between: {report.span}")
     lines.append(f"Page markup near the league label:\n{report.clue}")
     return "\n".join(lines)
 
@@ -382,20 +388,25 @@ def _beyond_horizon(rows: list[dict[str, Any]], now: datetime) -> bool:
     return min(starts) > cutoff
 
 
-def _fetch_group(label: str, eg: int, now: Optional[datetime], seen: set[str]) -> list[dict[str, Any]]:
+def _fetch_group(
+    label: str, eg: int, now: Optional[datetime], seen: set[str]
+) -> tuple[list[dict[str, Any]], int]:
     """Read pages for one league id, skipping games already in `seen`.
 
-    Pages are chronological, so paging stops once a page starts beyond
-    DK_HORIZON_DAYS (busy college slates otherwise need dozens of requests).
+    Keeps requesting the next page until one yields no new games (pagination
+    links are not always present in the raw HTML). Pages are chronological, so it
+    also stops once a page starts beyond DK_HORIZON_DAYS.
+
+    Returns:
+        (new rows, number of pages that contained games)
     """
-    now = now or datetime.now()
+    now = now or _now_et()
     rows: list[dict[str, Any]] = []
-    page, last = 1, 1
-    while page <= min(last, DK_MAX_PAGES):
+    page = 1
+    while page <= DK_MAX_PAGES:
         html = _get(
             {"tb_eg": eg, "itm_content": label, "tb_edate": "n7days", "tb_emt": "0", "tb_page": page}
         )
-        last = max(last, total_pages(html))
         fresh = [r for r in parse_dk_html(html, now) if r["event_id"] not in seen]
         if not fresh:
             break
@@ -404,7 +415,21 @@ def _fetch_group(label: str, eg: int, now: Optional[datetime], seen: set[str]) -
         page += 1
         if _beyond_horizon(fresh, now):
             break
-    return rows
+    return rows, page - 1
+
+
+def _now_et() -> datetime:
+    """Current Eastern wall-clock time as a naive datetime."""
+    return pd.Timestamp.now(tz=DISPLAY_TZ).tz_localize(None).to_pydatetime()
+
+
+def _span(rows: list[dict[str, Any]]) -> str:
+    """'first start -> last start' (Eastern) for the rows that have start times."""
+    starts = sorted(pd.Timestamp(r["event_start_time"]) for r in rows if r.get("event_start_time"))
+    if not starts:
+        return ""
+    fmt = "%a %b %d %I:%M %p ET"
+    return f"{starts[0].tz_convert(DISPLAY_TZ).strftime(fmt)} -> {starts[-1].tz_convert(DISPLAY_TZ).strftime(fmt)}"
 
 
 def fetch_dk_splits(
@@ -434,11 +459,16 @@ def fetch_dk_splits(
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     attempts: list[tuple[int, str, int]] = []
+    pages = 0
     for eg, origin in candidates:
-        got = _fetch_group(label, eg, now, seen)
+        got, n_pages = _fetch_group(label, eg, now, seen)
         attempts.append((eg, origin, len(got)))
         rows.extend(got)
-    report = DKReport(label=label, attempts=tuple(attempts), clue=markup_clue(base_html, label))
+        pages += n_pages
+    report = DKReport(
+        label=label, attempts=tuple(attempts), clue=markup_clue(base_html, label),
+        pages=pages, span=_span(rows),
+    )
     if not rows:
         raise DKSplitsError(
             "No games could be read from the DraftKings Network page "
