@@ -22,7 +22,8 @@ from line_history import toward_move
 SIGNALS_NAME = "auditor_signals.csv"
 COLUMNS = ["SIGNAL_ID", "FIRST_SEEN", "LEAGUE", "EVENT_ID", "GAME", "COMMENCE", "MARKET", "SELECTION", "TIER", "SCORE", "TICKETS", "HANDLE",
            "SIG_LINE", "SIG_PRICE", "LAST_TS", "LAST_LINE", "LAST_PRICE", "STATUS", "RESULT", "CLV"]
-SIGNAL_TIERS = ("LEAN", "SHARP")
+SIGNAL_TIERS = ("LEAN", "SHARP", "FILTERED")        # FILTERED picks are logged too, so the log can show whether the filters help
+REAL_TIERS = ("LEAN", "SHARP")
 MIN_GRADED = 50
 BREAKEVEN_PCT = 52.38
 Z95 = 1.959964
@@ -54,19 +55,27 @@ def signal_id(event_id: Any, market: Any, selection: Any) -> str:
 
 
 def record(signals: pd.DataFrame, best: pd.DataFrame, league: str, now_iso: str) -> Tuple[pd.DataFrame, int]:
-    """Add LEAN / SHARP picks from a board scan that are not logged yet. (log, number added)."""
+    """Add LEAN / SHARP / FILTERED picks from a board scan that are not logged yet; a pending FILTERED pick that later
+    becomes LEAN / SHARP is upgraded (its signal line and price become the ones at that moment). (log, number added)."""
     log = normalize(signals)
     if best is None or best.empty:
         return log, 0
-    pick = best[best["TIER"].isin(SIGNAL_TIERS)]
+    pick = best[best["TIER"].isin(SIGNAL_TIERS)].copy()
     if pick.empty:
         return log, 0
-    ids = [signal_id(e, m, s) for e, m, s in zip(pick["EVENT_ID"], pick["MARKET"], pick["SELECTION"])]
-    fresh = pick[[i not in set(log["SIGNAL_ID"]) for i in ids]].copy()
+    pick["_id"] = [signal_id(e, m, s) for e, m, s in zip(pick["EVENT_ID"], pick["MARKET"], pick["SELECTION"])]
+    known = set(log["SIGNAL_ID"])
+    up = pick[pick["_id"].isin(known) & pick["TIER"].isin(REAL_TIERS)]
+    if not up.empty:
+        idx = log.index[log["SIGNAL_ID"].isin(up["_id"]) & log["TIER"].eq("FILTERED") & log["STATUS"].eq("Pending")]
+        for i in idx:
+            r = up[up["_id"] == log.at[i, "SIGNAL_ID"]].iloc[0]
+            log.loc[i, ["TIER", "SCORE", "TICKETS", "HANDLE", "SIG_LINE", "SIG_PRICE", "FIRST_SEEN"]] = [r["TIER"], r["SCORE"], r["TICKETS_%"], r["HANDLE_%"], r["LINE"], r["PRICE"], now_iso]
+    fresh = pick[~pick["_id"].isin(known)]
     if fresh.empty:
         return log, 0
     add = pd.DataFrame({
-        "SIGNAL_ID": [signal_id(e, m, s) for e, m, s in zip(fresh["EVENT_ID"], fresh["MARKET"], fresh["SELECTION"])],
+        "SIGNAL_ID": fresh["_id"].to_numpy(),
         "FIRST_SEEN": now_iso, "LEAGUE": league, "EVENT_ID": fresh["EVENT_ID"].to_numpy(), "GAME": fresh["GAME"].to_numpy(),
         "COMMENCE": fresh["COMMENCE"].to_numpy(), "MARKET": fresh["MARKET"].to_numpy(), "SELECTION": fresh["SELECTION"].to_numpy(),
         "TIER": fresh["TIER"].to_numpy(), "SCORE": fresh["SCORE"].to_numpy(), "TICKETS": fresh["TICKETS_%"].to_numpy(),
@@ -201,7 +210,8 @@ def summary(signals: pd.DataFrame, by: str = "TIER") -> pd.DataFrame:
 
 def verdict(signals: pd.DataFrame) -> List[str]:
     """Cautious plain-English reading of the log."""
-    log = normalize(signals)
+    all_log = normalize(signals)
+    log = all_log[all_log["TIER"].isin(REAL_TIERS)]
     if log.empty:
         return ["No signals logged yet. Open the Board tab on game days: every LEAN / SHARP pick is saved automatically."]
     s = _summarize(log)
@@ -217,4 +227,8 @@ def verdict(signals: pd.DataFrame) -> List[str]:
             out.append(f"Hit rate {s['HIT_%']:.1f}% (range {s['LOW_%']:.1f}-{s['HIGH_%']:.1f}%): clearly below the {BREAKEVEN_PCT:.1f}% break-even. The weights may need changing.")
         else:
             out.append(f"Hit rate {s['HIT_%']:.1f}% (range {s['LOW_%']:.1f}-{s['HIGH_%']:.1f}%): can't be told apart from the {BREAKEVEN_PCT:.1f}% break-even yet.")
+    f = _summarize(all_log[all_log["TIER"].eq("FILTERED")])
+    if f["GRADED"] >= MIN_GRADED / 2 and s["GRADED"] >= MIN_GRADED / 2 and np.isfinite(f["HIT_%"]):
+        out.append(f"Filtered-out picks hit {f['HIT_%']:.0f}% ({int(f['GRADED'])} graded) vs {s['HIT_%']:.0f}% for the picks that passed: "
+                   + ("the filters are removing weaker picks." if f["HIT_%"] < s["HIT_%"] else "the filters are not helping yet; consider loosening them."))
     return out
