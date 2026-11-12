@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/34721118/README.md)
+[README.md](https://github.com/user-attachments/files/34769333/README.md)
 # Universal Multi-Sport Sharp & Whale Auditor
 
 Streamlit app. Main file: `UNIVERSALSWapp.py`. Upload EVERY file in this folder to GitHub (the app names any missing file on screen).
@@ -14,12 +14,23 @@ Streamlit app. Main file: `UNIVERSALSWapp.py`. Upload EVERY file in this folder 
 - **Signal log**: every LEAN / SHARP pick is saved with its line; after the games, grade them to see hit rate with a 95% range and how
   often the pick beat the closing line.
 
-## Score (0-100)
-Overlapping checks are grouped so each idea counts once. Money 40% = clip((handle% - tickets% - 5) / 30, 0, 1). Market reaction 35% =
-the larger of steam (line moved toward the pick, 2x the threshold = full) and reverse line movement (line moved toward the minority
-side); a move AWAY from the pick is negative. Timing 15% = an early or late move toward the pick. Key numbers 10% (spreads only).
-Groups that can't be measured yet are dropped and the rest re-weighted. NO DATA = no real splits. SHARP needs score >= 60 and the line
-confirming the money; LEAN needs score >= 40. The weights are assumptions: the signal log is how you check them.
+## How a pick is judged
+Five yes/no checks, shown as "CHECKS 3/5" (a check can also be "not yet known" until the app has watched long enough):
+1. **Money gap**: handle% minus tickets% is 15 points or more.
+2. **Bigger bets**: the average bet on this side is 1.5x or more the other side's.
+3. **Line moved toward it**: by at least 1 point (spreads / totals) or 3 probability points (moneylines) since the app first saw the line.
+4. **Held 30 minutes**: the money signal has been there for 30+ minutes of saved readings.
+5. **A market tell**: reverse line movement, an early (24h+ out) or late (closing window) move toward the pick, or a spread crossing a key number.
+
+**LEAN** = check 1 plus at least one more (the money is on this side). **SHARP** = checks 1, 3, 4 and 5: the money is real, the market agrees,
+it held, and there is a tell. **PASS** = anything else, including money the line moved AGAINST. **NO DATA** = no real splits.
+The NOTE column says what a LEAN still needs to become SHARP. Ties on the Board are broken by how strong the gap and bet size are.
+
+**Noise filters.** A pick that would be LEAN / SHARP but fails one becomes **FILTERED** (Board: "Filtered as noise"): price band (moneylines
+-300 to +250, spreads / totals -130 to +110, which removes the +5000 longshot), at least 15% of the tickets, clean splits (no 0% / 100%, two-way
+sides add to about 100%), the signal not new or flickering, more than 30 minutes to the start, and games you mark as injury / lineup news.
+The thresholds are assumptions; the signal log (which also logs FILTERED picks) shows whether to change them. The log's SCORE column is the
+number of checks met (older rows from the 0-100 version still show their old numbers).
 
 ## Limits
 - Line movement is measured from the first line this app saw, not the true opener, and only for leagues you open.
