@@ -14,11 +14,11 @@ import pandas as pd
 
 from auditor_core import FEATURED_MARKETS, PREFERRED_BOOK, SplitReading, format_commence, format_price, market_outcomes, match_split_rows, pick_bookmaker, read_split
 from line_history import Movement, movement
-from scoring import TIER_RANK, Context, Scored, pair_warning, score_selection
+from scoring import TIER_RANK, TOTAL_CHECKS, Context, Scored, pair_warning, score_selection
 from split_history import persistence
 
 SIDE_COLUMNS = ["EVENT_ID", "GAME", "COMMENCE", "WHEN", "MARKET", "SELECTION", "PICK", "LINE", "PRICE", "TICKETS_%", "HANDLE_%", "GAP", "BET_SIZE_X",
-                "TOWARD", "SCORE", "TIER", "MONEY", "REACTION", "TIMING", "STRUCTURE", "NOTE"]
+                "TOWARD", "CHECKS", "SCORE", "TIER", "MONEY", "NOTE"]
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,13 @@ class Evaluated:
     reading: Optional[SplitReading]
     movement: Movement
     scored: Scored
+
+
+def _note(sc: Scored) -> str:
+    """One line for the Board: the filter that blocked the pick, else what a LEAN still needs for SHARP, else the first note."""
+    if sc.tier != "FILTERED" and sc.needs:
+        return next((n for n in sc.notes if n.startswith("To become SHARP")), "")
+    return sc.notes[0] if sc.notes else ""
 
 
 def pick_label(market: str, selection: str, line: Optional[float], price: Any) -> str:
@@ -85,19 +92,19 @@ def scan_board(games: Sequence[Mapping[str, Any]], league: str, split_rows: Sequ
                             "WHEN": format_commence(g["commence_time"]), "MARKET": market, "SELECTION": name, "PICK": pick_label(market, name, line, price),
                             "LINE": line, "PRICE": price, "TICKETS_%": t, "HANDLE_%": h, "GAP": None if t is None else round(h - t, 1),
                             "BET_SIZE_X": None if sc.bet_size is None else round(min(sc.bet_size, 99.0), 1),
-                            "TOWARD": None if sc.toward is None else round(sc.toward, 2), "SCORE": round(sc.score, 1), "TIER": sc.tier,
-                            "MONEY": sc.money, "REACTION": sc.reaction, "TIMING": sc.timing, "STRUCTURE": sc.structure, "NOTE": sc.notes[0] if sc.notes else ""})
+                            "TOWARD": None if sc.toward is None else round(sc.toward, 2), "CHECKS": f"{sc.points}/{TOTAL_CHECKS}", "SCORE": float(sc.points),
+                            "TIER": sc.tier, "MONEY": sc.money, "NOTE": _note(sc)})
     all_sides = pd.DataFrame(rec, columns=SIDE_COLUMNS)
     if all_sides.empty:
         return all_sides.copy(), all_sides
-    ordered = all_sides.assign(_rank=all_sides["TIER"].map(TIER_RANK)).sort_values(["_rank", "SCORE"], ascending=False)
-    best = ordered.drop_duplicates(["EVENT_ID", "MARKET"], keep="first").drop(columns="_rank")
+    ordered = all_sides.assign(_rank=all_sides["TIER"].map(TIER_RANK), _m=all_sides["MONEY"].astype(float).fillna(0.0)).sort_values(["_rank", "SCORE", "_m"], ascending=False)
+    best = ordered.drop_duplicates(["EVENT_ID", "MARKET"], keep="first").drop(columns=["_rank", "_m"])
     return best.reset_index(drop=True), all_sides
 
 
 def pair_table(all_sides: pd.DataFrame, event_id: str, market: str) -> pd.DataFrame:
     """Both sides of one market next to each other, with the whale side marked."""
-    cols = ["PICK", "TICKETS_%", "HANDLE_%", "GAP", "BET_SIZE_X", "TOWARD", "SCORE", "TIER"]
+    cols = ["PICK", "TICKETS_%", "HANDLE_%", "GAP", "BET_SIZE_X", "TOWARD", "CHECKS", "TIER"]
     p = all_sides[(all_sides["EVENT_ID"] == event_id) & (all_sides["MARKET"] == market)]
     if p.empty:
         return pd.DataFrame(columns=cols + ["WHALE SIDE"])
