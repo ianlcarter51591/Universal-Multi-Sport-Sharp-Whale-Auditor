@@ -195,6 +195,17 @@ def fetch_event_market(
     return data.get("bookmakers", []), remaining
 
 
+def fetch_scores(sport_api_key: str, api_key: str, days_from: int = 3) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Recent finished scores for a sport (costs 2 Odds API credits per call when days_from is used)."""
+    data, remaining = _request(
+        f"{BASE_URL}/{sport_api_key}/scores/",
+        {"apiKey": api_key, "daysFrom": int(max(1, min(3, days_from)))},
+    )
+    if not isinstance(data, list):
+        raise OddsAPIError("Unexpected response shape from The Odds API.")
+    return data, remaining
+
+
 # --- Splits matching (rows come from dk_splits.py) ---------------------------
 @dataclass(frozen=True)
 class SplitReading:
