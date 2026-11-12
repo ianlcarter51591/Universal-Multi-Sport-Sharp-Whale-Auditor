@@ -1,6 +1,6 @@
 """Universal Sharp & Whale Action Auditor: Streamlit UI.
 
-Tabs: Board (every game scored at once), Audit a game (one selection in detail, both sides of the market), Signal log
+Tabs: Board (every game scored at once), Audit a game (one selection in detail, both sides of the market), Parlay (price a ticket), Signal log
 (does LEAN / SHARP beat the closing line and the result?).
 
 Odds: The Odds API. Handle / bet splits: free DraftKings Network page. Line history and the signal log are saved to a
@@ -18,7 +18,7 @@ from typing import Any, Optional
 import pandas as pd
 import streamlit as st
 
-REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py")
+REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py", "parlay.py", "parlay_ui.py")
 _missing = [f for f in REQUIRED_FILES if not (Path(__file__).resolve().parent / f).exists()]
 if _missing:
     st.error("These files are missing from the app folder in GitHub: " + ", ".join(_missing) + ". Upload them next to this file and reboot the app.")
@@ -28,6 +28,7 @@ import audit_log
 import cloud_store
 import persist
 import split_history as sh
+import parlay_ui
 from auditor_core import (
     EVENT_ONLY_MARKETS,
     FEATURED_MARKETS,
@@ -478,11 +479,13 @@ def main() -> None:
     if n_new or not signals.equals(before):
         store_signals(signals)
 
-    tab_board, tab_audit, tab_log = st.tabs(["🏆 Board", "🔍 Audit a game", "📒 Signal log"])
+    tab_board, tab_audit, tab_parlay, tab_log = st.tabs(["🏆 Board", "🔍 Audit a game", "🎟️ Parlay", "📒 Signal log"])
     with tab_board:
         render_board(best, split_status, split_rows, diag, len(history))
     with tab_audit:
         render_audit(league, games, odds_key, split_rows, all_sides, history, split_hist, news_ids, manual, now)
+    with tab_parlay:
+        parlay_ui.render_parlay(st, all_sides)
     with tab_log:
         render_log(league, odds_key, now)
     cloud_store.flush()
