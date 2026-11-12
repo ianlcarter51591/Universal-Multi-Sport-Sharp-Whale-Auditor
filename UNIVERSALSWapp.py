@@ -1,34 +1,41 @@
 """Universal Sharp & Whale Action Auditor: Streamlit UI.
 
-Run with:  streamlit run app.py
-Requires auditor_core.py and dk_splits.py in the same folder.
+Tabs: Board (every game scored at once), Audit a game (one selection in detail, both sides of the market), Signal log
+(does LEAN / SHARP beat the closing line and the result?).
 
-Odds come from The Odds API. Handle / bet splits come from the free DraftKings
-Network splits page (no key needed). The Odds API key loads automatically on open
-(first match wins):
-    1. .streamlit/secrets.toml  (ODDS_API_KEY)
-    2. environment variable     (ODDS_API_KEY)
-The sidebar key box is an optional override.
+Odds: The Odds API. Handle / bet splits: free DraftKings Network page. Line history and the signal log are saved to a
+private GitHub Gist when GITHUB_GIST_TOKEN is set (otherwise to local files that reset when Streamlit Cloud restarts).
+Secrets (first match wins): .streamlit/secrets.toml, then environment variables: ODDS_API_KEY, GITHUB_GIST_TOKEN.
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
+import pandas as pd
 import streamlit as st
 
+REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py")
+_missing = [f for f in REQUIRED_FILES if not (Path(__file__).resolve().parent / f).exists()]
+if _missing:
+    st.error("These files are missing from the app folder in GitHub: " + ", ".join(_missing) + ". Upload them next to this file and reboot the app.")
+    st.stop()
+
+import audit_log
+import cloud_store
+import persist
 from auditor_core import (
     EVENT_ONLY_MARKETS,
     FEATURED_MARKETS,
     SPORT_CONFIG,
     OddsAPIError,
     SplitReading,
-    audit_market,
-    checklist_table,
     fetch_event_market,
     fetch_featured_odds,
+    fetch_scores,
     format_commence,
     format_price,
     game_label,
@@ -38,13 +45,10 @@ from auditor_core import (
     pick_bookmaker,
     read_split,
 )
-from dk_splits import (
-    DKResult,
-    DKSplitsError,
-    coverage_report,
-    describe_report,
-    fetch_dk_splits,
-)
+from board_scan import pair_table, scan_board
+from dk_splits import DKResult, DKSplitsError, coverage_report, describe_report, fetch_dk_splits, parse_dk_override
+from line_history import COLUMNS as HIST_COLUMNS, HISTORY_NAME, KEY as HIST_KEY, append_new, movement, prune, rows_from_games
+from scoring import pair_warning, score_selection
 
 # --- Theme palette (swap these to restyle the whole app) ---------------------
 WHITE = "#FFFFFF"
@@ -148,31 +152,29 @@ def build_css() -> str:
 CSS = build_css()
 
 
+TIER_ICON = {"SHARP": "🔥 SHARP", "LEAN": "👀 LEAN", "PASS": "🚫 PASS", "NO DATA": "⛔ NO DATA"}
+
+
 @dataclass(frozen=True)
 class ManualInputs:
-    """Sidebar inputs: manual split fallback plus timing flags."""
+    """Sidebar overrides. Nothing is used unless its box is ticked: the app never invents splits or movement."""
 
+    use_splits: bool
     ticket_pct: float
     handle_pct: float
-    force_manual: bool
+    use_move: bool
     line_movement: float
-    is_opening_move: bool
-    is_closing_window: bool
 
 
 # --- Cached API wrappers (exceptions are NOT cached by Streamlit) -------------
 @st.cache_data(ttl=600, show_spinner="Pulling live odds...")
-def cached_featured(
-    sport_api_key: str, api_key: str
-) -> tuple[list[dict[str, Any]], Optional[str]]:
+def cached_featured(sport_api_key: str, api_key: str) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Cached bulk odds pull (10 min)."""
     return fetch_featured_odds(sport_api_key, api_key)
 
 
 @st.cache_data(ttl=600, show_spinner="Pulling team totals...")
-def cached_event_market(
-    sport_api_key: str, event_id: str, api_key: str, market: str
-) -> tuple[list[dict[str, Any]], Optional[str]]:
+def cached_event_market(sport_api_key: str, event_id: str, api_key: str, market: str) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Cached single-event market pull (costs extra API credits)."""
     return fetch_event_market(sport_api_key, event_id, api_key, market)
 
@@ -192,54 +194,26 @@ def load_secret(name: str) -> str:
     return str(value or os.environ.get(name, ""))
 
 
-def render_sidebar() -> tuple[str, str, ManualInputs]:
-    """Draw the sidebar; return (league, odds key, manual inputs)."""
+def render_sidebar() -> tuple[str, str, str, ManualInputs]:
+    """Draw the sidebar; return (league, odds key, DraftKings override text, manual inputs)."""
     odds_default = load_secret("ODDS_API_KEY")
-
     with st.sidebar:
         st.header("⚙️ Configuration & Feed")
         league = st.selectbox("Select League / Sport", list(SPORT_CONFIG.keys()))
-
         with st.expander("🔑 API key", expanded=not odds_default):
-            st.caption(
-                "Auto-loaded from secrets / environment when set. "
-                "Type here only to override."
-            )
-            odds_key = st.text_input(
-                "The Odds API Key", value=odds_default, type="password"
-            )
-
-        st.divider()
-        st.markdown("### 📊 Splits & Line Movement")
-        line_movement = st.number_input(
-            "Net Line Movement (pts from open)",
-            value=-1.0,
-            step=0.5,
-            help="Negative = market moved TOWARD this selection; positive = away.",
-        )
-        col_a, col_b = st.columns(2)
-        with col_a:
-            is_opening_move = st.checkbox("Early Opener Action")
-        with col_b:
-            is_closing_window = st.checkbox("Closing Window / Limit Time")
-
-        with st.expander("✍️ Manual splits (fallback / override)"):
-            force_manual = st.checkbox("Always use manual splits")
-            ticket_pct = st.slider(
-                "Public Ticket % (% of Bets)", min_value=0.0, max_value=100.0, value=30.0
-            )
-            handle_pct = st.slider(
-                "Public Handle % (% of Money)", min_value=0.0, max_value=100.0, value=85.0
-            )
-
-    return (
-        league,
-        odds_key,
-        ManualInputs(
-            ticket_pct, handle_pct, force_manual, line_movement,
-            is_opening_move, is_closing_window,
-        ),
-    )
+            st.caption("Auto-loaded from secrets / environment when set. Type here only to override.")
+            odds_key = st.text_input("The Odds API Key", value=odds_default, type="password")
+        override = st.text_input("DraftKings page URL or tb_eg id (optional)", value="",
+                                 help="Only needed if a league's splits don't load: pick the league on the DraftKings Network page and paste the address.")
+        with st.expander("✍️ Manual overrides (only when you tick them)"):
+            use_splits = st.checkbox("Use manual splits")
+            ticket_pct = st.slider("Public Ticket % (% of Bets)", min_value=0.0, max_value=100.0, value=50.0)
+            handle_pct = st.slider("Public Handle % (% of Money)", min_value=0.0, max_value=100.0, value=50.0)
+            use_move = st.checkbox("Use manual line movement")
+            move = st.number_input("Line movement from open (negative = toward this pick)", value=0.0, step=0.5)
+        status = cloud_store.status()
+        (st.caption if status["level"] == "ok" else st.warning)(("💾 " if status["level"] == "ok" else "⚠️ ") + status["text"])
+    return league, odds_key, override, ManualInputs(bool(use_splits), float(ticket_pct), float(handle_pct), bool(use_move), float(move))
 
 
 def market_label(market: str) -> str:
@@ -247,85 +221,208 @@ def market_label(market: str) -> str:
     return f"{market} (extra API credit)" if market in EVENT_ONLY_MARKETS else market
 
 
-def resolve_splits(
-    league: str,
-    game: dict[str, Any],
-    market_type: str,
-    selection: str,
-) -> tuple[Optional[SplitReading], str, str]:
-    """Look up live DraftKings Network splits for the chosen selection.
-
-    Returns:
-        (reading or None, status caption, diagnostics text)
-    """
+# --- Splits -------------------------------------------------------------------
+def load_splits(league: str, override: str) -> tuple[list[dict[str, Any]], str, str]:
+    """Rows from the DraftKings Network page for the league. (rows, status text, diagnostics); rows empty on failure."""
     cfg = SPORT_CONFIG[league]
+    label, eg, note = cfg.dk_label, cfg.dk_event_group, ""
+    if override.strip():
+        parsed = parse_dk_override(override, cfg.dk_label)
+        if parsed is None:
+            note = "Could not find a tb_eg id in the pasted text; using the built-in league id. "
+        else:
+            label, eg = parsed
     try:
-        result = cached_dk_splits(cfg.dk_label, cfg.dk_event_group)
+        result = cached_dk_splits(label, eg)
     except DKSplitsError as exc:
-        return None, f"Splits unavailable: {exc} Using manual splits.", describe_report(exc.report)
+        return [], f"{note}Splits unavailable: {exc}", describe_report(exc.report)
+    stamp = next((r.get("fetched_at") for r in result.rows if r.get("fetched_at")), None)
+    return list(result.rows), f"{note}Splits: **DraftKings Network** (all jurisdictions)" + (f" | updated {stamp}" if stamp else ""), describe_report(result.report)
 
-    diag = describe_report(result.report)
-    rows = result.rows
-    event_rows = match_split_rows(
-        rows, game["away_team"], game["home_team"], game["commence_time"]
-    )
+
+def reading_for(rows: list[dict[str, Any]], game: dict[str, Any], market: str, selection: str) -> tuple[Optional[SplitReading], str]:
+    """Splits for one selection, or (None, why not)."""
+    if not rows:
+        return None, "No splits were loaded."
+    event_rows = match_split_rows(rows, game["away_team"], game["home_team"], game["commence_time"])
     if not event_rows:
-        wanted = f"{game['away_team']} @ {game['home_team']} ({format_commence(game['commence_time'])})"
-        listing = "\n".join(
-            f"  {r['away_team']} @ {r['home_team']}  {r.get('event_start_time', '?')}" for r in rows[:40]
-        )
-        diag += f"\nLooking for: {wanted}\nGames read from the page:\n{listing}"
-        span = f" The page covers {result.report.span}." if result.report.span else ""
-        sample = "; ".join(f"{r['away_team']} @ {r['home_team']}" for r in rows[:3])
-        return None, (
-            f"No DraftKings Network splits matched {wanted} ({len(rows)} games read, "
-            f"e.g. {sample}).{span} It may not be posted yet. Using manual splits."
-        ), diag
-    reading = read_split(
-        event_rows, market_type, selection, game["away_team"], game["home_team"]
-    )
+        return None, f"No DraftKings Network splits matched {game['away_team']} @ {game['home_team']} ({format_commence(game['commence_time'])}). It may not be posted yet."
+    reading = read_split(event_rows, market, selection, game["away_team"], game["home_team"])
     if reading is None:
-        return None, (
-            f"DraftKings Network has no handle + bets splits for {market_type} on this "
-            "selection. Using manual splits."
-        ), diag
-    stamp = f" | updated {reading.fetched_at}" if reading.fetched_at else ""
-    return reading, f"Splits: **DraftKings Network** (all jurisdictions){stamp}", diag
+        return None, f"DraftKings Network has no handle + bets splits for {market} on this selection."
+    return reading, ""
+
+
+# --- Stored data ----------------------------------------------------------------
+def get_history() -> pd.DataFrame:
+    """Saved line readings (loaded once per session)."""
+    if "aud_history" not in st.session_state:
+        st.session_state["aud_history"] = persist.load(HISTORY_NAME, HIST_COLUMNS)
+    return st.session_state["aud_history"]
+
+
+def get_signals() -> pd.DataFrame:
+    """Saved signal log (loaded once per session)."""
+    if "aud_signals" not in st.session_state:
+        st.session_state["aud_signals"] = audit_log.normalize(persist.load(audit_log.SIGNALS_NAME, audit_log.COLUMNS))
+    return st.session_state["aud_signals"]
+
+
+def store_history(history: pd.DataFrame) -> None:
+    """Save line readings (permanent storage merges anything it already held)."""
+    st.session_state["aud_history"] = persist.save(HISTORY_NAME, history, ["TS"] + HIST_KEY, HIST_COLUMNS)
+
+
+def store_signals(signals: pd.DataFrame, force: bool = False) -> None:
+    """Save the signal log."""
+    st.session_state["aud_signals"] = audit_log.normalize(persist.save(audit_log.SIGNALS_NAME, signals, ["SIGNAL_ID"], audit_log.COLUMNS, force))
+
+
+# --- Tabs -----------------------------------------------------------------------
+def render_board(best: pd.DataFrame, split_status: str, split_rows: list, diag: str, hist_rows: int) -> None:
+    """Ranked table of every game / market."""
+    (st.caption if split_rows else st.warning)(split_status)
+    if best.empty:
+        st.info("No upcoming games to scan.")
+        return
+    tiers = best["TIER"].value_counts()
+    c1, c2, c3, c4 = st.columns(4)
+    for col, label, value in zip((c1, c2, c3, c4), ("SHARP", "LEAN", "Markets scanned", "Line readings saved"),
+                                 (int(tiers.get("SHARP", 0)), int(tiers.get("LEAN", 0)), len(best), hist_rows)):
+        with col:
+            st.metric(label, value)
+    if not split_rows:
+        st.warning("No real splits loaded, so every market shows NO DATA. Nothing is scored from made-up numbers.")
+    show = st.selectbox("Show", ["LEAN and SHARP", "Everything"])
+    view = best if show == "Everything" else best[best["TIER"].isin(["LEAN", "SHARP"])]
+    if view.empty and split_rows:
+        st.info("Nothing reaches LEAN right now. Choose Everything to see the full board.")
+    cols = ["WHEN", "GAME", "MARKET", "PICK", "TICKETS_%", "HANDLE_%", "GAP", "TOWARD", "SCORE", "TIER", "NOTE"]
+    st.dataframe(view[cols], use_container_width=True, hide_index=True)
+    st.caption("One row per game and market: the side with the money. TOWARD = how far the line has moved toward the pick since this app "
+               "first saw it (negative = away). Score 0-100: money 40%, market reaction 35%, timing 15%, key numbers 10%. "
+               "SHARP needs the line to confirm the money; without line history the best tier is LEAN.")
+    if diag:
+        with st.expander("🔧 Splits diagnostics"):
+            st.code(diag)
+    with st.expander("🧪 DraftKings league coverage check"):
+        if st.button("Check every league"):
+            with st.spinner("Checking leagues..."):
+                st.table(coverage_report({n: (c.dk_label, c.dk_event_group) for n, c in SPORT_CONFIG.items()}, fetch=cached_dk_splits))
+
+
+def render_audit(league: str, games: list[dict[str, Any]], odds_key: str, split_rows: list, all_sides: pd.DataFrame,
+                 history: pd.DataFrame, manual: ManualInputs, now: pd.Timestamp) -> None:
+    """One selection in detail."""
+    cfg = SPORT_CONFIG[league]
+    game_idx = st.selectbox("Select Matchup to Audit", range(len(games)), format_func=lambda i: game_label(games[i]))
+    game = games[game_idx]
+    book = pick_bookmaker(game.get("bookmakers", []))
+    if book is None:
+        st.error("No active bookmaker odds available for this game.")
+        return
+    st.caption(f"Active Book Feed: **{book['title']}** | Last Updated: {book.get('last_update', 'N/A')}")
+    market_dict = market_outcomes(book)
+    markets = [m for m in FEATURED_MARKETS if m in market_dict] + list(EVENT_ONLY_MARKETS)
+    market = st.selectbox("Select Market Type", markets, format_func=market_label)
+    if market in EVENT_ONLY_MARKETS:
+        try:
+            ev_books, _ = cached_event_market(cfg.api_key, game["id"], odds_key, market)
+        except OddsAPIError as exc:
+            st.error(str(exc))
+            return
+        ev_book = pick_bookmaker(ev_books)
+        outcomes = market_outcomes(ev_book).get(market, []) if ev_book else []
+        if not outcomes:
+            st.warning(f"No {market} currently posted for this game.")
+            return
+    else:
+        outcomes = market_dict[market]
+    chosen = outcomes[st.selectbox("Select Specific Selection", range(len(outcomes)), format_func=lambda i: outcome_label(outcomes[i]))]
+    line, price, name = chosen.get("point"), chosen.get("price"), chosen["name"]
+
+    reading, why = (None, "") if (manual.use_splits or market in EVENT_ONLY_MARKETS) else reading_for(split_rows, game, market, name)
+    if manual.use_splits:
+        ticket, handle, source = manual.ticket_pct, manual.handle_pct, "Splits: **manual** (override on)."
+    elif reading is not None:
+        ticket, handle = reading.ticket_pct, reading.handle_pct
+        source = "Splits: **DraftKings Network**" + (f" | updated {reading.fetched_at}" if reading.fetched_at else "")
+    else:
+        ticket = handle = None
+        source = why or "No splits are published for team totals; tick manual splits in the sidebar to score one."
+    (st.caption if ticket is not None else st.warning)(source)
+
+    mv = None if market in EVENT_ONLY_MARKETS else movement(history, game["id"], market, name, game["commence_time"], now, line, price)
+    if manual.use_move:
+        mv = None
+    sc = score_selection(league, market, line, ticket, handle, mv, manual.line_movement if manual.use_move else None)
+
+    st.divider()
+    c1, c2, c3 = st.columns(3)
+    gap_text = "n/a" if ticket is None else f"{handle - ticket:+.1f}% vs Public Bets"
+    with c1:
+        st.metric(label="Auditor Verdict", value=TIER_ICON[sc.tier], delta=f"Score {sc.score:.0f}/100", delta_color="off")
+    with c2:
+        st.metric(label="Handle vs. Ticket Gap" + ("" if ticket is None else f" ({ticket:.0f}% bets)"),
+                  value="n/a" if handle is None else f"{handle:.0f}% Handle", delta=gap_text)
+    with c3:
+        st.metric(label="Current Line & Price", value=format_price(price), delta=f"Line/Spread: {line if line is not None else 'N/A'}", delta_color="off")
+
+    if market in FEATURED_MARKETS and not manual.use_splits:
+        pair = pair_table(all_sides, game["id"], market)
+        if not pair.empty:
+            st.markdown("### ⚖️ Both sides of this market")
+            st.dataframe(pair, use_container_width=True, hide_index=True)
+            warn = pair_warning(pd.to_numeric(pair["TICKETS_%"], errors="coerce").dropna().tolist(), pd.to_numeric(pair["HANDLE_%"], errors="coerce").dropna().tolist())
+            st.caption(warn or "In a two-way market the sides mirror each other: the money is on the side with the positive gap.")
+    st.markdown("### 📋 Checklist breakdown")
+    st.table(pd.DataFrame(sc.rows))
+    for note in sc.notes:
+        st.caption("• " + note)
+    if mv is not None and mv.has_history:
+        st.caption(f"First line this app saw: {mv.open_line} at {mv.open_ts} ({mv.n_points} readings). That is not necessarily the true opener.")
+
+
+def render_log(league: str, odds_key: str, now: pd.Timestamp) -> None:
+    """Signal log, validation tables and grading."""
+    signals = get_signals()
+    st.markdown("### 📒 Does the Auditor beat the market?")
+    for line in audit_log.verdict(signals):
+        st.info(line)
+    if not signals.empty:
+        st.markdown("**By tier** (LOW / HIGH = 95% range; BEAT_CLOSE_% = picks whose line was better than the last line the app saw)")
+        st.dataframe(audit_log.summary(signals, "TIER").round(1), use_container_width=True, hide_index=True)
+        st.markdown("**By market**")
+        st.dataframe(audit_log.summary(signals, "MARKET").round(1), use_container_width=True, hide_index=True)
+    if st.button(f"Grade finished {league} games (uses 2 Odds API credits)"):
+        try:
+            scores, _ = fetch_scores(SPORT_CONFIG[league].api_key, odds_key)
+        except OddsAPIError as exc:
+            st.error(str(exc))
+        else:
+            graded, n = audit_log.grade(signals, scores, now)
+            store_signals(graded, force=True)
+            st.success(f"Graded {n} pick(s).")
+    if not signals.empty:
+        st.dataframe(signals.sort_values("FIRST_SEEN", ascending=False).head(200), use_container_width=True, hide_index=True)
+        st.download_button("Download signal log (CSV)", signals.to_csv(index=False), file_name="auditor_signals.csv")
+    st.caption("Picks are logged only while the app is open on a league, and the 'closing line' is the last line the app saw. "
+               "Results come from The Odds API scores (finished games from the last 3 days only: grade often).")
 
 
 def main() -> None:
     """Page entry point."""
-    st.set_page_config(
-        page_title="Universal Sharp & Whale Action Auditor",
-        page_icon="⚡",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Universal Sharp & Whale Action Auditor", page_icon="⚡", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     st.title("⚡ Universal Sharp & Whale Action Auditor")
-    st.markdown(
-        "Live odds from **The Odds API** plus handle / bet splits from "
-        "**DraftKings Network**, scored on a 6-point whale checklist."
-    )
+    st.markdown("Live odds from **The Odds API** plus handle / bet splits from **DraftKings Network**, scored on a weighted whale checklist.")
 
-    league, odds_key, manual = render_sidebar()
+    cloud_store.configure(load_secret("GITHUB_GIST_TOKEN"))
+    league, odds_key, override, manual = render_sidebar()
     cfg = SPORT_CONFIG[league]
-
-    with st.expander("🧪 DraftKings league coverage check"):
-        st.caption("Tries every league on the DraftKings Network page and shows what it returns.")
-        if st.button("Check every league"):
-            with st.spinner("Checking leagues..."):
-                st.table(coverage_report(
-                    {n: (c.dk_label, c.dk_event_group) for n, c in SPORT_CONFIG.items()},
-                    fetch=cached_dk_splits,
-                ))
-
     if not odds_key:
-        st.warning(
-            "⚠️ No Odds API key found. Add ODDS_API_KEY to .streamlit/secrets.toml "
-            "(or your environment), or enter it under 🔑 API key in the sidebar."
-        )
+        st.warning("⚠️ No Odds API key found. Add ODDS_API_KEY to .streamlit/secrets.toml (or your environment), or enter it under 🔑 API key in the sidebar.")
         return
-
     try:
         games, remaining = cached_featured(cfg.api_key, odds_key)
     except OddsAPIError as exc:
@@ -333,126 +430,32 @@ def main() -> None:
         return
     if remaining is not None:
         st.sidebar.caption(f"Odds API credits remaining: {remaining}")
-
     if not games:
-        st.info(
-            f"No upcoming games found for {league}. Check API quota or schedule."
-        )
+        st.info(f"No upcoming games found for {league}. Check API quota or schedule.")
         return
 
-    st.subheader(f"Upcoming Live Markets: {league}")
-    game_idx = st.selectbox(
-        "Select Matchup to Audit",
-        range(len(games)),
-        format_func=lambda i: game_label(games[i]),
-    )
-    game = games[game_idx]
+    now = pd.Timestamp.now(tz="UTC")
+    history, added = append_new(get_history(), rows_from_games(games, league, now.isoformat()))
+    if added:
+        store_history(prune(history, now))
+        history = get_history()
+    split_rows, split_status, diag = load_splits(league, override)
+    best, all_sides = scan_board(games, league, split_rows, history, now)
 
-    book = pick_bookmaker(game.get("bookmakers", []))
-    if book is None:
-        st.error("No active bookmaker odds available for this game.")
-        return
-    st.caption(
-        f"Active Book Feed: **{book['title']}** | Last Updated: "
-        f"{book.get('last_update', 'N/A')}"
-    )
+    before = get_signals()
+    signals, n_new = audit_log.record(before, best, league, now.isoformat())
+    signals = audit_log.finalize_clv(audit_log.update_closing(signals, all_sides, now), now)
+    if n_new or not signals.equals(before):
+        store_signals(signals)
 
-    market_dict = market_outcomes(book)
-    markets = [m for m in FEATURED_MARKETS if m in market_dict] + list(
-        EVENT_ONLY_MARKETS
-    )
-    market_type = st.selectbox("Select Market Type", markets, format_func=market_label)
-
-    if market_type in EVENT_ONLY_MARKETS:
-        try:
-            ev_books, _ = cached_event_market(
-                cfg.api_key, game["id"], odds_key, market_type
-            )
-        except OddsAPIError as exc:
-            st.error(str(exc))
-            return
-        ev_book = pick_bookmaker(ev_books)
-        outcomes = market_outcomes(ev_book).get(market_type, []) if ev_book else []
-        if not outcomes:
-            st.warning(f"No {market_type} currently posted for this game.")
-            return
-    else:
-        outcomes = market_dict[market_type]
-
-    chosen_idx = st.selectbox(
-        "Select Specific Selection",
-        range(len(outcomes)),
-        format_func=lambda i: outcome_label(outcomes[i]),
-    )
-    chosen = outcomes[chosen_idx]
-    line_val = chosen.get("point")
-    odds_price = chosen.get("price")
-
-    # --- Splits: DraftKings Network first, manual sliders as fallback / override
-    reading: Optional[SplitReading] = None
-    diag = ""
-    if manual.force_manual:
-        status = "Splits: **manual** (override on)."
-    else:
-        reading, status, diag = resolve_splits(
-            league, game, market_type, chosen["name"]
-        )
-    ticket_pct = reading.ticket_pct if reading else manual.ticket_pct
-    handle_pct = reading.handle_pct if reading else manual.handle_pct
-    if reading is None and not manual.force_manual:
-        st.warning(status)
-    else:
-        st.caption(status)
-    if diag:
-        with st.expander("🔧 Splits diagnostics"):
-            st.code(diag)
-
-    result = audit_market(
-        league,
-        market_type,
-        line_val,
-        ticket_pct,
-        handle_pct,
-        manual.line_movement,
-        manual.is_opening_move,
-        manual.is_closing_window,
-    )
-
-    st.divider()
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric(
-            label="Auditor Verdict",
-            value="🔥 WHALE / SHARP PLAY" if result.is_sharp else "🚫 PASS",
-            delta=f"{result.passed}/{result.applicable} Criteria Met",
-            delta_color="off",
-        )
-    with col2:
-        st.metric(
-            label=f"Handle vs. Ticket Gap ({ticket_pct:.0f}% bets)",
-            value=f"{handle_pct:.0f}% Handle",
-            delta=f"{handle_pct - ticket_pct:+.1f}% vs Public Bets",
-        )
-    with col3:
-        st.metric(
-            label="Current Line & Price",
-            value=format_price(odds_price),
-            delta=f"Line/Spread: {line_val if line_val is not None else 'N/A'}",
-            delta_color="off",
-        )
-
-    st.markdown("### 📋 Universal Whale Checklist Breakdown")
-    st.table(
-        checklist_table(
-            result,
-            league,
-            ticket_pct,
-            handle_pct,
-            manual.line_movement,
-            manual.is_opening_move,
-            manual.is_closing_window,
-        )
-    )
+    tab_board, tab_audit, tab_log = st.tabs(["🏆 Board", "🔍 Audit a game", "📒 Signal log"])
+    with tab_board:
+        render_board(best, split_status, split_rows, diag, len(history))
+    with tab_audit:
+        render_audit(league, games, odds_key, split_rows, all_sides, history, manual, now)
+    with tab_log:
+        render_log(league, odds_key, now)
+    cloud_store.flush()
 
 
 if __name__ == "__main__":
