@@ -18,7 +18,7 @@ from typing import Any, Optional
 import pandas as pd
 import streamlit as st
 
-REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py")
+REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py")
 _missing = [f for f in REQUIRED_FILES if not (Path(__file__).resolve().parent / f).exists()]
 if _missing:
     st.error("These files are missing from the app folder in GitHub: " + ", ".join(_missing) + ". Upload them next to this file and reboot the app.")
@@ -27,6 +27,7 @@ if _missing:
 import audit_log
 import cloud_store
 import persist
+import split_history as sh
 from auditor_core import (
     EVENT_ONLY_MARKETS,
     FEATURED_MARKETS,
@@ -45,10 +46,10 @@ from auditor_core import (
     pick_bookmaker,
     read_split,
 )
-from board_scan import pair_table, scan_board
+from board_scan import evaluate_market, pair_table, scan_board
 from dk_splits import DKResult, DKSplitsError, coverage_report, describe_report, fetch_dk_splits, parse_dk_override
 from line_history import COLUMNS as HIST_COLUMNS, HISTORY_NAME, KEY as HIST_KEY, append_new, movement, prune, rows_from_games
-from scoring import pair_warning, score_selection
+from scoring import TOTAL_CHECKS, Context, pair_warning, score_selection
 
 # --- Theme palette (swap these to restyle the whole app) ---------------------
 WHITE = "#FFFFFF"
@@ -152,7 +153,7 @@ def build_css() -> str:
 CSS = build_css()
 
 
-TIER_ICON = {"SHARP": "🔥 SHARP", "LEAN": "👀 LEAN", "PASS": "🚫 PASS", "NO DATA": "⛔ NO DATA"}
+TIER_ICON = {"SHARP": "🔥 SHARP", "LEAN": "👀 LEAN", "PASS": "🚫 PASS", "FILTERED": "🧹 FILTERED", "NO DATA": "⛔ NO DATA"}
 
 
 @dataclass(frozen=True)
@@ -268,6 +269,18 @@ def get_signals() -> pd.DataFrame:
     return st.session_state["aud_signals"]
 
 
+def get_split_history() -> pd.DataFrame:
+    """Saved ticket / handle readings (loaded once per session)."""
+    if "aud_splits" not in st.session_state:
+        st.session_state["aud_splits"] = persist.load(sh.SPLIT_NAME, sh.COLUMNS)
+    return st.session_state["aud_splits"]
+
+
+def store_split_history(history: pd.DataFrame) -> None:
+    """Save ticket / handle readings."""
+    st.session_state["aud_splits"] = persist.save(sh.SPLIT_NAME, history, ["TS"] + sh.KEY, sh.COLUMNS)
+
+
 def store_history(history: pd.DataFrame) -> None:
     """Save line readings (permanent storage merges anything it already held)."""
     st.session_state["aud_history"] = persist.save(HISTORY_NAME, history, ["TS"] + HIST_KEY, HIST_COLUMNS)
@@ -286,22 +299,25 @@ def render_board(best: pd.DataFrame, split_status: str, split_rows: list, diag: 
         st.info("No upcoming games to scan.")
         return
     tiers = best["TIER"].value_counts()
-    c1, c2, c3, c4 = st.columns(4)
-    for col, label, value in zip((c1, c2, c3, c4), ("SHARP", "LEAN", "Markets scanned", "Line readings saved"),
-                                 (int(tiers.get("SHARP", 0)), int(tiers.get("LEAN", 0)), len(best), hist_rows)):
+    cols5 = st.columns(5)
+    for col, label, value in zip(cols5, ("SHARP", "LEAN", "Filtered as noise", "Markets scanned", "Line readings saved"),
+                                 (int(tiers.get("SHARP", 0)), int(tiers.get("LEAN", 0)), int(tiers.get("FILTERED", 0)), len(best), hist_rows)):
         with col:
             st.metric(label, value)
     if not split_rows:
         st.warning("No real splits loaded, so every market shows NO DATA. Nothing is scored from made-up numbers.")
-    show = st.selectbox("Show", ["LEAN and SHARP", "Everything"])
-    view = best if show == "Everything" else best[best["TIER"].isin(["LEAN", "SHARP"])]
+    show = st.selectbox("Show", ["LEAN and SHARP", "Filtered as noise", "Everything"])
+    view = best if show == "Everything" else best[best["TIER"].isin(["FILTERED"] if show == "Filtered as noise" else ["LEAN", "SHARP"])]
     if view.empty and split_rows:
         st.info("Nothing reaches LEAN right now. Choose Everything to see the full board.")
-    cols = ["WHEN", "GAME", "MARKET", "PICK", "TICKETS_%", "HANDLE_%", "GAP", "TOWARD", "SCORE", "TIER", "NOTE"]
+    cols = ["WHEN", "GAME", "MARKET", "PICK", "TICKETS_%", "HANDLE_%", "GAP", "BET_SIZE_X", "TOWARD", "CHECKS", "TIER", "NOTE"]
     st.dataframe(view[cols], use_container_width=True, hide_index=True)
-    st.caption("One row per game and market: the side with the money. TOWARD = how far the line has moved toward the pick since this app "
-               "first saw it (negative = away). Score 0-100: money 40%, market reaction 35%, timing 15%, key numbers 10%. "
-               "SHARP needs the line to confirm the money; without line history the best tier is LEAN.")
+    st.caption("How to read it: one row per game and market, showing the side with the money. CHECKS = how many of 5 yes/no checks are met: "
+               "(1) money gap of 15+ points, (2) bigger bets, (3) the line moved toward the pick, (4) the signal held 30 minutes, (5) a market tell "
+               "(reverse movement, an early / late move, or a key-number cross). LEAN = the money is on this side. SHARP = money, line move, "
+               "30-minute hold and a tell all agree. FILTERED = it would be LEAN / SHARP but failed a noise filter. NOTE says what a LEAN still needs. "
+               "TOWARD = how far the line has moved toward the pick since this app first saw it (negative = away). BET_SIZE_X = how many times bigger "
+               "the average bet is on this side than the other.")
     if diag:
         with st.expander("🔧 Splits diagnostics"):
             st.code(diag)
@@ -312,7 +328,7 @@ def render_board(best: pd.DataFrame, split_status: str, split_rows: list, diag: 
 
 
 def render_audit(league: str, games: list[dict[str, Any]], odds_key: str, split_rows: list, all_sides: pd.DataFrame,
-                 history: pd.DataFrame, manual: ManualInputs, now: pd.Timestamp) -> None:
+                 history: pd.DataFrame, split_hist: pd.DataFrame, news_ids: list, manual: ManualInputs, now: pd.Timestamp) -> None:
     """One selection in detail."""
     cfg = SPORT_CONFIG[league]
     game_idx = st.selectbox("Select Matchup to Audit", range(len(games)), format_func=lambda i: game_label(games[i]))
@@ -338,30 +354,33 @@ def render_audit(league: str, games: list[dict[str, Any]], odds_key: str, split_
             return
     else:
         outcomes = market_dict[market]
-    chosen = outcomes[st.selectbox("Select Specific Selection", range(len(outcomes)), format_func=lambda i: outcome_label(outcomes[i]))]
+    chosen_idx = st.selectbox("Select Specific Selection", range(len(outcomes)), format_func=lambda i: outcome_label(outcomes[i]))
+    chosen = outcomes[chosen_idx]
     line, price, name = chosen.get("point"), chosen.get("price"), chosen["name"]
 
-    reading, why = (None, "") if (manual.use_splits or market in EVENT_ONLY_MARKETS) else reading_for(split_rows, game, market, name)
-    if manual.use_splits:
-        ticket, handle, source = manual.ticket_pct, manual.handle_pct, "Splits: **manual** (override on)."
-    elif reading is not None:
-        ticket, handle = reading.ticket_pct, reading.handle_pct
-        source = "Splits: **DraftKings Network**" + (f" | updated {reading.fetched_at}" if reading.fetched_at else "")
+    featured = market in FEATURED_MARKETS and not manual.use_splits
+    if featured:
+        event_rows = match_split_rows(split_rows, game["away_team"], game["home_team"], game["commence_time"]) if split_rows else []
+        ev = evaluate_market(game, market, outcomes, event_rows, history, split_hist, now, league, news_ids)[chosen_idx]
+        reading, mv, sc = ev.reading, ev.movement, ev.scored
+        ticket, handle = (reading.ticket_pct, reading.handle_pct) if reading else (None, None)
+        if reading is not None:
+            source = "Splits: **DraftKings Network**" + (f" | updated {reading.fetched_at}" if reading.fetched_at else "")
+        else:
+            source = reading_for(split_rows, game, market, name)[1]
     else:
-        ticket = handle = None
-        source = why or "No splits are published for team totals; tick manual splits in the sidebar to score one."
+        ticket, handle = (manual.ticket_pct, manual.handle_pct) if manual.use_splits else (None, None)
+        source = "Splits: **manual** (override on)." if manual.use_splits else "No splits are published for team totals; tick manual splits in the sidebar to score one."
+        mv = None if market in EVENT_ONLY_MARKETS or manual.use_move else movement(history, game["id"], market, name, game["commence_time"], now, line, price)
+        sc = score_selection(league, market, line, ticket, handle, mv, manual.line_movement if manual.use_move else None,
+                             Context(price=None if price is None else float(price), news=game["id"] in news_ids))
     (st.caption if ticket is not None else st.warning)(source)
-
-    mv = None if market in EVENT_ONLY_MARKETS else movement(history, game["id"], market, name, game["commence_time"], now, line, price)
-    if manual.use_move:
-        mv = None
-    sc = score_selection(league, market, line, ticket, handle, mv, manual.line_movement if manual.use_move else None)
 
     st.divider()
     c1, c2, c3 = st.columns(3)
     gap_text = "n/a" if ticket is None else f"{handle - ticket:+.1f}% vs Public Bets"
     with c1:
-        st.metric(label="Auditor Verdict", value=TIER_ICON[sc.tier], delta=f"Score {sc.score:.0f}/100", delta_color="off")
+        st.metric(label="Auditor Verdict", value=TIER_ICON[sc.tier], delta=f"{sc.points}/{TOTAL_CHECKS} checks met", delta_color="off")
     with c2:
         st.metric(label="Handle vs. Ticket Gap" + ("" if ticket is None else f" ({ticket:.0f}% bets)"),
                   value="n/a" if handle is None else f"{handle:.0f}% Handle", delta=gap_text)
@@ -375,10 +394,13 @@ def render_audit(league: str, games: list[dict[str, Any]], odds_key: str, split_
             st.dataframe(pair, use_container_width=True, hide_index=True)
             warn = pair_warning(pd.to_numeric(pair["TICKETS_%"], errors="coerce").dropna().tolist(), pd.to_numeric(pair["HANDLE_%"], errors="coerce").dropna().tolist())
             st.caption(warn or "In a two-way market the sides mirror each other: the money is on the side with the positive gap.")
-    st.markdown("### 📋 Checklist breakdown")
+    st.markdown("### 🧹 Noise filters")
+    st.table(pd.DataFrame(sc.filters))
+    st.markdown("### 📋 The five checks")
     st.table(pd.DataFrame(sc.rows))
     for note in sc.notes:
         st.caption("• " + note)
+    st.caption("SHARP = checks 1, 3, 4 and 5 all met. LEAN = check 1 plus at least one more. A pick that fails a noise filter shows as FILTERED.")
     if mv is not None and mv.has_history:
         st.caption(f"First line this app saw: {mv.open_line} at {mv.open_ts} ({mv.n_points} readings). That is not necessarily the true opener.")
 
@@ -415,7 +437,7 @@ def main() -> None:
     st.set_page_config(page_title="Universal Sharp & Whale Action Auditor", page_icon="⚡", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     st.title("⚡ Universal Sharp & Whale Action Auditor")
-    st.markdown("Live odds from **The Odds API** plus handle / bet splits from **DraftKings Network**, scored on a weighted whale checklist.")
+    st.markdown("Live odds from **The Odds API** plus handle / bet splits from **DraftKings Network**, scored on a five-check whale checklist.")
 
     cloud_store.configure(load_secret("GITHUB_GIST_TOKEN"))
     league, odds_key, override, manual = render_sidebar()
@@ -439,8 +461,16 @@ def main() -> None:
     if added:
         store_history(prune(history, now))
         history = get_history()
+    with st.sidebar:
+        labels = {g["id"]: game_label(g) for g in games}
+        news_ids = list(st.multiselect("Games with injury / lineup news", list(labels), format_func=lambda i: labels[i],
+                                       help="Moves after news are everyone's money, not sharp money: marked games are filtered out.") or [])
     split_rows, split_status, diag = load_splits(league, override)
-    best, all_sides = scan_board(games, league, split_rows, history, now)
+    split_hist = get_split_history()
+    best, all_sides = scan_board(games, league, split_rows, history, now, split_hist, news_ids)
+    split_hist, n_split = sh.append_new(split_hist, sh.rows_from_sides(all_sides, now.isoformat()))
+    if n_split:
+        store_split_history(sh.prune(split_hist, now))
 
     before = get_signals()
     signals, n_new = audit_log.record(before, best, league, now.isoformat())
@@ -452,7 +482,7 @@ def main() -> None:
     with tab_board:
         render_board(best, split_status, split_rows, diag, len(history))
     with tab_audit:
-        render_audit(league, games, odds_key, split_rows, all_sides, history, manual, now)
+        render_audit(league, games, odds_key, split_rows, all_sides, history, split_hist, news_ids, manual, now)
     with tab_log:
         render_log(league, odds_key, now)
     cloud_store.flush()
