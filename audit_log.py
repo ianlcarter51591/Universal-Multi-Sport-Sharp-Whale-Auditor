@@ -21,7 +21,7 @@ from line_history import toward_move
 
 SIGNALS_NAME = "auditor_signals.csv"
 COLUMNS = ["SIGNAL_ID", "FIRST_SEEN", "LEAGUE", "EVENT_ID", "GAME", "COMMENCE", "MARKET", "SELECTION", "TIER", "SCORE", "TICKETS", "HANDLE",
-           "SIG_LINE", "SIG_PRICE", "LAST_TS", "LAST_LINE", "LAST_PRICE", "STATUS", "RESULT", "CLV"]
+           "SIG_LINE", "SIG_PRICE", "LAST_TS", "LAST_LINE", "LAST_PRICE", "STATUS", "RESULT", "CLV", "OFF_EV", "OFF_MARKET"]
 SIGNAL_TIERS = ("LEAN", "SHARP", "FILTERED")        # FILTERED picks are logged too, so the log can show whether the filters help
 REAL_TIERS = ("LEAN", "SHARP")
 MIN_GRADED = 50
@@ -43,7 +43,7 @@ def normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         if c not in out.columns:
             out[c] = pd.NA
     out = out[COLUMNS]
-    numeric = ("SCORE", "TICKETS", "HANDLE", "SIG_LINE", "SIG_PRICE", "LAST_LINE", "LAST_PRICE", "CLV")
+    numeric = ("SCORE", "TICKETS", "HANDLE", "SIG_LINE", "SIG_PRICE", "LAST_LINE", "LAST_PRICE", "CLV", "OFF_EV")
     for c in COLUMNS:
         out[c] = pd.to_numeric(out[c], errors="coerce") if c in numeric else out[c].astype(object)   # text columns stay text even when all empty
     return out.drop_duplicates("SIGNAL_ID", keep="last").reset_index(drop=True)
@@ -54,19 +54,28 @@ def signal_id(event_id: Any, market: Any, selection: Any) -> str:
     return f"{event_id}|{market}|{selection}"
 
 
-def record(signals: pd.DataFrame, best: pd.DataFrame, league: str, now_iso: str) -> Tuple[pd.DataFrame, int]:
-    """Add LEAN / SHARP / FILTERED picks from a board scan that are not logged yet; a pending FILTERED pick that later
-    becomes LEAN / SHARP is upgraded (its signal line and price become the ones at that moment). (log, number added)."""
+def record(signals: pd.DataFrame, best: pd.DataFrame, league: str, now_iso: str, extra: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, int]:
+    """Add LEAN / SHARP / FILTERED picks from a board scan that are not logged yet, plus any OFF_MARKET side in `extra` (all scanned sides) so the
+    log can compare the two sources. A pending FILTERED pick that later becomes LEAN / SHARP is upgraded (its signal line and price become the ones
+    at that moment); a pending off-market-only (PASS) pick that later becomes LEAN / SHARP only changes label and scores. (log, number added)."""
     log = normalize(signals)
     if best is None or best.empty:
         return log, 0
     pick = best[best["TIER"].isin(SIGNAL_TIERS)].copy()
+    if extra is not None and not extra.empty and "OFF_MARKET" in extra.columns:
+        off = extra[extra["OFF_MARKET"].fillna(False).astype(bool)]
+        if not off.empty:
+            pick = pd.concat([pick, off], ignore_index=True)
+            pick = pick.drop_duplicates(["EVENT_ID", "MARKET", "SELECTION"], keep="first")
     if pick.empty:
         return log, 0
     pick["_id"] = [signal_id(e, m, s) for e, m, s in zip(pick["EVENT_ID"], pick["MARKET"], pick["SELECTION"])]
     known = set(log["SIGNAL_ID"])
     up = pick[pick["_id"].isin(known) & pick["TIER"].isin(REAL_TIERS)]
     if not up.empty:
+        for i in log.index[log["SIGNAL_ID"].isin(up["_id"]) & ~log["TIER"].isin(REAL_TIERS + ("FILTERED",)) & log["STATUS"].eq("Pending")]:
+            r = up[up["_id"] == log.at[i, "SIGNAL_ID"]].iloc[0]
+            log.loc[i, ["TIER", "SCORE", "TICKETS", "HANDLE"]] = [r["TIER"], r["SCORE"], r["TICKETS_%"], r["HANDLE_%"]]
         idx = log.index[log["SIGNAL_ID"].isin(up["_id"]) & log["TIER"].eq("FILTERED") & log["STATUS"].eq("Pending")]
         for i in idx:
             r = up[up["_id"] == log.at[i, "SIGNAL_ID"]].iloc[0]
@@ -81,7 +90,9 @@ def record(signals: pd.DataFrame, best: pd.DataFrame, league: str, now_iso: str)
         "TIER": fresh["TIER"].to_numpy(), "SCORE": fresh["SCORE"].to_numpy(), "TICKETS": fresh["TICKETS_%"].to_numpy(),
         "HANDLE": fresh["HANDLE_%"].to_numpy(), "SIG_LINE": fresh["LINE"].to_numpy(), "SIG_PRICE": fresh["PRICE"].to_numpy(),
         "LAST_TS": now_iso, "LAST_LINE": fresh["LINE"].to_numpy(), "LAST_PRICE": fresh["PRICE"].to_numpy(),
-        "STATUS": "Pending", "RESULT": pd.NA, "CLV": np.nan})
+        "STATUS": "Pending", "RESULT": pd.NA, "CLV": np.nan,
+        "OFF_EV": fresh["VS_MKT_EV_%"].to_numpy() if "VS_MKT_EV_%" in fresh.columns else np.nan,
+        "OFF_MARKET": np.where(fresh["OFF_MARKET"].fillna(False).astype(bool), "Y", "") if "OFF_MARKET" in fresh.columns else ""})
     return normalize(pd.concat([log, add], ignore_index=True)), len(add)
 
 
@@ -198,12 +209,22 @@ def _summarize(group: pd.DataFrame) -> Dict[str, float]:
             "BEAT_CLOSE_%": 100.0 * float((clv > 0).mean()) if len(clv) else np.nan, "CLV_COUNT": float(len(clv))}
 
 
+def source(log: pd.DataFrame) -> pd.Series:
+    """Why each pick was logged: both, off-market only (money gap did not qualify), whale only, or filtered as noise."""
+    off = log["OFF_MARKET"].eq("Y")
+    real = log["TIER"].isin(REAL_TIERS)
+    return pd.Series(np.select([off & real, off & ~real, real, log["TIER"].eq("FILTERED")], ["Off-market + whale", "Off-market only", "Whale only", "Filtered"], "Other"),
+                     index=log.index)
+
+
 def summary(signals: pd.DataFrame, by: str = "TIER") -> pd.DataFrame:
     """Hit rate with interval and share of picks that beat the close, by TIER or MARKET."""
     log = normalize(signals)
     cols = [by, "SIGNALS", "GRADED", "HIT_%", "LOW_%", "HIGH_%", "BEAT_CLOSE_%", "CLV_COUNT"]
     if log.empty:
         return pd.DataFrame(columns=cols)
+    if by == "SOURCE":
+        log = log.assign(SOURCE=source(log))
     rows = [{by: k, **_summarize(g)} for k, g in log.groupby(by, sort=True)]
     return pd.DataFrame(rows, columns=cols)
 
@@ -227,6 +248,11 @@ def verdict(signals: pd.DataFrame) -> List[str]:
             out.append(f"Hit rate {s['HIT_%']:.1f}% (range {s['LOW_%']:.1f}-{s['HIGH_%']:.1f}%): clearly below the {BREAKEVEN_PCT:.1f}% break-even. The weights may need changing.")
         else:
             out.append(f"Hit rate {s['HIT_%']:.1f}% (range {s['LOW_%']:.1f}-{s['HIGH_%']:.1f}%): can't be told apart from the {BREAKEVEN_PCT:.1f}% break-even yet.")
+    src = source(all_log)
+    om, wh = _summarize(all_log[src.isin(["Off-market + whale", "Off-market only"])]), _summarize(all_log[src.eq("Whale only")])
+    if om["CLV_COUNT"] >= 20 and wh["CLV_COUNT"] >= 20:
+        out.append(f"Beat-the-close rate: off-market picks {om['BEAT_CLOSE_%']:.0f}% ({int(om['CLV_COUNT'])}) vs whale-only picks {wh['BEAT_CLOSE_%']:.0f}% ({int(wh['CLV_COUNT'])}): "
+                   + ("off-market is the stronger source so far." if om["BEAT_CLOSE_%"] > wh["BEAT_CLOSE_%"] else "the whale signal is holding up at least as well."))
     f = _summarize(all_log[all_log["TIER"].eq("FILTERED")])
     if f["GRADED"] >= MIN_GRADED / 2 and s["GRADED"] >= MIN_GRADED / 2 and np.isfinite(f["HIT_%"]):
         out.append(f"Filtered-out picks hit {f['HIT_%']:.0f}% ({int(f['GRADED'])} graded) vs {s['HIT_%']:.0f}% for the picks that passed: "
