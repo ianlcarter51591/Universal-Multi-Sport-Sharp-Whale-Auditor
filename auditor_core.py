@@ -156,15 +156,15 @@ def _request(
 
 
 def fetch_featured_odds(
-    sport_api_key: str, api_key: str
+    sport_api_key: str, api_key: str, bookmakers: Optional[str] = None
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
-    """Fetch spreads/totals/moneyline for every upcoming game in a sport."""
+    """Fetch spreads/totals/moneyline for every upcoming game in a sport (all US books, or only the comma-separated `bookmakers`)."""
     params = {
         "apiKey": api_key,  # NOTE: camelCase is required by the API
-        "regions": "us",
         "markets": ",".join(FEATURED_MARKETS),
         "oddsFormat": "american",  # NOTE: camelCase is required by the API
     }
+    params.update({"bookmakers": bookmakers} if bookmakers else {"regions": "us"})
     try:
         data, remaining = _request(f"{BASE_URL}/{sport_api_key}/odds/", {**params, "includeLinks": "true"})   # bookmaker deep links for the bet buttons
     except OddsAPIError as exc:
