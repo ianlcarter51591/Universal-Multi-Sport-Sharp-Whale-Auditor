@@ -16,10 +16,11 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+import bet_links as bl
 import parlay as pl
 from line_history import implied_prob
 
-POOL_COLUMNS = ["LABEL", "GAME", "WHEN", "TIER", "CHECKS", "P_MARKET", "ODDS"]
+POOL_COLUMNS = ["LABEL", "GAME", "WHEN", "TIER", "CHECKS", "P_MARKET", "ODDS", "LINK", "LINK_KIND"]
 
 
 def legs_from_board(all_sides: pd.DataFrame) -> pd.DataFrame:
@@ -32,6 +33,8 @@ def legs_from_board(all_sides: pd.DataFrame) -> pd.DataFrame:
     total = s.groupby(["EVENT_ID", "MARKET"])["_imp"].transform("sum")
     s["P_MARKET"] = s["_imp"] / total
     s["LABEL"] = s["GAME"] + " | " + s["PICK"]
+    if "LINK" not in s.columns:
+        s["LINK"], s["LINK_KIND"] = bl.DK_HOME, "home"
     out = s.rename(columns={"PRICE": "ODDS"})
     out = out[(out["P_MARKET"] > 0) & (out["P_MARKET"] < 1)]
     return out[POOL_COLUMNS].drop_duplicates("LABEL").reset_index(drop=True)
@@ -58,13 +61,32 @@ def _legs(st: Any) -> List[Dict[str, Any]]:
     return ss["parlay_legs"]
 
 
-def add_leg(st: Any, label: str, p_model: float, odds: Optional[float], p_market: Optional[float], game: str) -> bool:
+def add_leg(st: Any, label: str, p_model: float, odds: Optional[float], p_market: Optional[float], game: str,
+            link: Optional[str] = None, kind: str = "home") -> bool:
     """Append a leg unless the same label is already on the ticket."""
     legs = _legs(st)
     if not label or any(l["label"] == label for l in legs):
         return False
-    legs.append({"label": label, "p_model": float(p_model), "odds": odds, "p_market": p_market, "game": str(game or "").strip()})
+    legs.append({"label": label, "p_model": float(p_model), "odds": odds, "p_market": p_market, "game": str(game or "").strip(),
+                 "link": link or bl.DK_HOME, "kind": kind if link else "home"})
     return True
+
+
+def render_slip(st: Any, legs: List[Dict[str, Any]]) -> None:
+    """DraftKings buttons for the ticket: one link per leg, plus a button that opens them all. The app never places the bet."""
+    st.markdown("**Take it to DraftKings**")
+    links = [(l.get("link") or bl.DK_HOME, l.get("kind", "home")) for l in legs]
+    for l, (url, kind) in zip(legs, links):
+        st.markdown(f"- {l['label']}: [Bet on DraftKings ↗]({url}) ({bl.KIND_LABEL.get(kind, kind)})")
+    n_real = bl.real_links(links)
+    try:
+        from streamlit.components.v1 import html as _components_html
+        _components_html(bl.open_all_html([u for u, _ in links], f"➕ Add slip: open all {len(links)} legs"), height=60)
+    except Exception:
+        pass       # no components support (tests): the per-leg links above still work
+    st.caption(f"{n_real} of {len(links)} legs have a DraftKings link that adds the pick to your bet slip or opens the market; "
+               "the rest open the DraftKings sportsbook. Each link opens in its own tab (allow pop-ups for this site once). DraftKings decides "
+               "what the link does, so check the slip: the price and line there are DraftKings' current ones, and you confirm the bet yourself.")
 
 
 def render_parlay(st: Any, all_sides: Optional[pd.DataFrame]) -> None:
@@ -89,7 +111,7 @@ def render_parlay(st: Any, all_sides: Optional[pd.DataFrame]) -> None:
             c3.write("")
             if c3.button("➕ Add leg", key="parlay_add"):
                 ok = add_leg(st, r["LABEL"], _num(mine, 50.0) / 100.0, None if pd.isna(r["ODDS"]) else float(r["ODDS"]),
-                             float(r["P_MARKET"]), r["GAME"])
+                             float(r["P_MARKET"]), r["GAME"], r["LINK"], r["LINK_KIND"])
                 (st.toast if ok else st.warning)("Leg added" if ok else "That leg is already on the ticket.")
     else:
         st.caption("No scanned games yet. Add legs by hand below.")
@@ -119,6 +141,7 @@ def render_parlay(st: Any, all_sides: Optional[pd.DataFrame]) -> None:
     if st.button("Clear ticket", key="parlay_clear"):
         ss["parlay_legs"] = []
         st.rerun()
+    render_slip(st, legs)
     p1, p2, p3 = st.columns(3)
     offered = _num(p1.number_input("Parlay odds offered, before any boost (0 = multiply the leg odds)", value=0, step=5, key="parlay_offered"), 0.0)
     boost = _num(p2.number_input("Boost %", min_value=0.0, max_value=200.0, value=0.0, step=5.0, key="parlay_boost"), 0.0)
