@@ -18,7 +18,7 @@ from typing import Any, Optional
 import pandas as pd
 import streamlit as st
 
-REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py", "parlay.py", "parlay_ui.py", "bet_links.py")
+REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py", "parlay.py", "parlay_ui.py", "bet_links.py", "market_edge.py")
 _missing = [f for f in REQUIRED_FILES if not (Path(__file__).resolve().parent / f).exists()]
 if _missing:
     st.error("These files are missing from the app folder in GitHub: " + ", ".join(_missing) + ". Upload them next to this file and reboot the app.")
@@ -28,6 +28,7 @@ import audit_log
 import cloud_store
 import persist
 import split_history as sh
+import market_edge
 import parlay_ui
 from auditor_core import (
     EVENT_ONLY_MARKETS,
@@ -170,9 +171,9 @@ class ManualInputs:
 
 # --- Cached API wrappers (exceptions are NOT cached by Streamlit) -------------
 @st.cache_data(ttl=600, show_spinner="Pulling live odds...")
-def cached_featured(sport_api_key: str, api_key: str) -> tuple[list[dict[str, Any]], Optional[str]]:
-    """Cached bulk odds pull (10 min)."""
-    return fetch_featured_odds(sport_api_key, api_key)
+def cached_featured(sport_api_key: str, api_key: str, bookmakers: str = "") -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Cached bulk odds pull (10 min); `bookmakers` limits it to those books (used for the optional Pinnacle reference)."""
+    return fetch_featured_odds(sport_api_key, api_key, bookmakers or None)
 
 
 @st.cache_data(ttl=600, show_spinner="Pulling team totals...")
@@ -213,6 +214,8 @@ def render_sidebar() -> tuple[str, str, str, ManualInputs]:
             handle_pct = st.slider("Public Handle % (% of Money)", min_value=0.0, max_value=100.0, value=50.0)
             use_move = st.checkbox("Use manual line movement")
             move = st.number_input("Line movement from open (negative = toward this pick)", value=0.0, step=0.5)
+        st.checkbox("Compare against Pinnacle only (DraftKings + Pinnacle)", key="aud_pinnacle",
+                    help="One request for just these two books: about the same credits as the normal US pull, and Pinnacle (the sharpest price) is the reference. Other US books are not loaded. Games Pinnacle has not priced are skipped.")
         status = cloud_store.status()
         (st.caption if status["level"] == "ok" else st.warning)(("💾 " if status["level"] == "ok" else "⚠️ ") + status["text"])
     return league, odds_key, override, ManualInputs(bool(use_splits), float(ticket_pct), float(handle_pct), bool(use_move), float(move))
@@ -293,7 +296,7 @@ def store_signals(signals: pd.DataFrame, force: bool = False) -> None:
 
 
 # --- Tabs -----------------------------------------------------------------------
-def render_board(best: pd.DataFrame, split_status: str, split_rows: list, diag: str, hist_rows: int) -> None:
+def render_board(best: pd.DataFrame, split_status: str, split_rows: list, diag: str, hist_rows: int, all_sides: Optional[pd.DataFrame] = None) -> None:
     """Ranked table of every game / market."""
     (st.caption if split_rows else st.warning)(split_status)
     if best.empty:
@@ -307,18 +310,25 @@ def render_board(best: pd.DataFrame, split_status: str, split_rows: list, diag: 
             st.metric(label, value)
     if not split_rows:
         st.warning("No real splits loaded, so every market shows NO DATA. Nothing is scored from made-up numbers.")
-    show = st.selectbox("Show", ["LEAN and SHARP", "Filtered as noise", "Everything"])
-    view = best if show == "Everything" else best[best["TIER"].isin(["FILTERED"] if show == "Filtered as noise" else ["LEAN", "SHARP"])]
-    if view.empty and split_rows:
+    has_ref = all_sides is not None and "OFF_MARKET" in all_sides.columns
+    show = st.selectbox("Show", ["LEAN and SHARP", "Filtered as noise", "Everything"] + (["Off-market (DraftKings pays more than other books)"] if has_ref else []))
+    if show.startswith("Off-market"):
+        view = all_sides[all_sides["OFF_MARKET"].fillna(False).astype(bool)].sort_values("VS_MKT_EV_%", ascending=False)
+        if view.empty:
+            st.info(f"No side is {market_edge.OFF_MARKET_EV:g}%+ better at DraftKings than at the other books right now.")
+    else:
+        view = best if show == "Everything" else best[best["TIER"].isin(["FILTERED"] if show == "Filtered as noise" else ["LEAN", "SHARP"])]
+    if view.empty and split_rows and not show.startswith("Off-market"):
         st.info("Nothing reaches LEAN right now. Choose Everything to see the full board.")
-    cols = ["WHEN", "GAME", "MARKET", "PICK", "TICKETS_%", "HANDLE_%", "GAP", "BET_SIZE_X", "TOWARD", "CHECKS", "TIER", "NOTE"]
+    cols = ["WHEN", "GAME", "MARKET", "PICK", "TICKETS_%", "HANDLE_%", "GAP", "BET_SIZE_X", "TOWARD", "CHECKS", "TIER", "FAIR_%", "VS_MKT_EV_%", "REF_BOOKS", "NOTE"]
     st.dataframe(view[cols], use_container_width=True, hide_index=True)
     st.caption("How to read it: one row per game and market, showing the side with the money. CHECKS = how many of 5 yes/no checks are met: "
                "(1) money gap of 15+ points, (2) bigger bets, (3) the line moved toward the pick, (4) the signal held 30 minutes, (5) a market tell "
                "(reverse movement, an early / late move, or a key-number cross). LEAN = the money is on this side. SHARP = money, line move, "
                "30-minute hold and a tell all agree. FILTERED = it would be LEAN / SHARP but failed a noise filter. NOTE says what a LEAN still needs. "
                "TOWARD = how far the line has moved toward the pick since this app first saw it (negative = away). BET_SIZE_X = how many times bigger "
-               "the average bet is on this side than the other.")
+               "the average bet is on this side than the other. FAIR_% = what the other books say the side's chance is (vig removed, averaged); VS_MKT_EV_% = "
+               "what a bet at DraftKings' price is worth if that is right (REF_BOOKS = how many books agree; blank = too few comparable books).")
     if diag:
         with st.expander("🔧 Splits diagnostics"):
             st.code(diag)
@@ -395,6 +405,19 @@ def render_audit(league: str, games: list[dict[str, Any]], odds_key: str, split_
             st.dataframe(pair, use_container_width=True, hide_index=True)
             warn = pair_warning(pd.to_numeric(pair["TICKETS_%"], errors="coerce").dropna().tolist(), pd.to_numeric(pair["HANDLE_%"], errors="coerce").dropna().tolist())
             st.caption(warn or "In a two-way market the sides mirror each other: the money is on the side with the positive gap.")
+    if market in FEATURED_MARKETS and book.get("key") == "draftkings":
+        refs = pd.DataFrame(market_edge.reference_rows(game, market, name, line, "draftkings", now))
+        st.markdown("### 📡 Other books on this pick")
+        if refs.empty:
+            st.caption("No other books are listed for this game.")
+        else:
+            e = market_edge.edge(game, market, name, line, price, "draftkings", now)
+            if e["VS_MKT_EV_%"] is None:
+                st.caption("Not enough comparable books to say whether DraftKings is off the market.")
+            else:
+                (st.success if e["OFF_MARKET"] else st.caption)(f"Other books put this side at {e['FAIR_%']:.1f}%; at DraftKings' price that is {e['VS_MKT_EV_%']:+.1f}% EV "
+                                                                 f"({e['REF_BOOKS']} books" + (", OFF-MARKET)." if e["OFF_MARKET"] else ")."))
+            st.dataframe(refs.drop(columns=["KEY"]).round(1), use_container_width=True, hide_index=True)
     st.markdown("### 🧹 Noise filters")
     st.table(pd.DataFrame(sc.filters))
     st.markdown("### 📋 The five checks")
@@ -415,6 +438,8 @@ def render_log(league: str, odds_key: str, now: pd.Timestamp) -> None:
     if not signals.empty:
         st.markdown("**By tier** (LOW / HIGH = 95% range; BEAT_CLOSE_% = picks whose line was better than the last line the app saw)")
         st.dataframe(audit_log.summary(signals, "TIER").round(1), use_container_width=True, hide_index=True)
+        st.markdown("**By source** (why the pick was logged: off-market price, whale money, both, or filtered as noise)")
+        st.dataframe(audit_log.summary(signals, "SOURCE").round(1), use_container_width=True, hide_index=True)
         st.markdown("**By market**")
         st.dataframe(audit_log.summary(signals, "MARKET").round(1), use_container_width=True, hide_index=True)
     if st.button(f"Grade finished {league} games (uses 2 Odds API credits)"):
@@ -447,7 +472,7 @@ def main() -> None:
         st.warning("⚠️ No Odds API key found. Add ODDS_API_KEY to .streamlit/secrets.toml (or your environment), or enter it under 🔑 API key in the sidebar.")
         return
     try:
-        games, remaining = cached_featured(cfg.api_key, odds_key)
+        games, remaining = cached_featured(cfg.api_key, odds_key, "draftkings,pinnacle" if st.session_state.get("aud_pinnacle") else "")
     except OddsAPIError as exc:
         st.error(str(exc))
         return
@@ -474,14 +499,14 @@ def main() -> None:
         store_split_history(sh.prune(split_hist, now))
 
     before = get_signals()
-    signals, n_new = audit_log.record(before, best, league, now.isoformat())
+    signals, n_new = audit_log.record(before, best, league, now.isoformat(), extra=all_sides)
     signals = audit_log.finalize_clv(audit_log.update_closing(signals, all_sides, now), now)
     if n_new or not signals.equals(before):
         store_signals(signals)
 
     tab_board, tab_audit, tab_parlay, tab_log = st.tabs(["🏆 Board", "🔍 Audit a game", "🎟️ Parlay", "📒 Signal log"])
     with tab_board:
-        render_board(best, split_status, split_rows, diag, len(history))
+        render_board(best, split_status, split_rows, diag, len(history), all_sides)
     with tab_audit:
         render_audit(league, games, odds_key, split_rows, all_sides, history, split_hist, news_ids, manual, now)
     with tab_parlay:
