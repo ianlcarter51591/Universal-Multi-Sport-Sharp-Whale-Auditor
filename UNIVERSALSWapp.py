@@ -18,7 +18,7 @@ from typing import Any, Optional
 import pandas as pd
 import streamlit as st
 
-REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py", "parlay.py", "parlay_ui.py")
+REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py", "parlay.py", "parlay_ui.py", "bet_links.py")
 _missing = [f for f in REQUIRED_FILES if not (Path(__file__).resolve().parent / f).exists()]
 if _missing:
     st.error("These files are missing from the app folder in GitHub: " + ", ".join(_missing) + ". Upload them next to this file and reboot the app.")
