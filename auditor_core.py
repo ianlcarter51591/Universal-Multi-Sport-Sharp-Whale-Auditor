@@ -159,15 +159,18 @@ def fetch_featured_odds(
     sport_api_key: str, api_key: str
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Fetch spreads/totals/moneyline for every upcoming game in a sport."""
-    data, remaining = _request(
-        f"{BASE_URL}/{sport_api_key}/odds/",
-        {
-            "apiKey": api_key,  # NOTE: camelCase is required by the API
-            "regions": "us",
-            "markets": ",".join(FEATURED_MARKETS),
-            "oddsFormat": "american",  # NOTE: camelCase is required by the API
-        },
-    )
+    params = {
+        "apiKey": api_key,  # NOTE: camelCase is required by the API
+        "regions": "us",
+        "markets": ",".join(FEATURED_MARKETS),
+        "oddsFormat": "american",  # NOTE: camelCase is required by the API
+    }
+    try:
+        data, remaining = _request(f"{BASE_URL}/{sport_api_key}/odds/", {**params, "includeLinks": "true"})   # bookmaker deep links for the bet buttons
+    except OddsAPIError as exc:
+        if not any(f"({c})" in str(exc) for c in (400, 422)):
+            raise
+        data, remaining = _request(f"{BASE_URL}/{sport_api_key}/odds/", params)       # plan or API without links: plain odds, buttons fall back to DraftKings home
     if not isinstance(data, list):
         raise OddsAPIError("Unexpected response shape from The Odds API.")
     return data, remaining
