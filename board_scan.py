@@ -15,11 +15,12 @@ import pandas as pd
 from auditor_core import FEATURED_MARKETS, PREFERRED_BOOK, SplitReading, format_commence, format_price, market_outcomes, match_split_rows, pick_bookmaker, read_split
 from line_history import Movement, movement
 from scoring import TIER_RANK, TOTAL_CHECKS, Context, Scored, pair_warning, score_selection
+import market_edge
 from bet_links import best_link, market_map
 from split_history import persistence
 
 SIDE_COLUMNS = ["EVENT_ID", "GAME", "COMMENCE", "WHEN", "MARKET", "SELECTION", "PICK", "LINE", "PRICE", "TICKETS_%", "HANDLE_%", "GAP", "BET_SIZE_X",
-                "TOWARD", "CHECKS", "SCORE", "TIER", "MONEY", "NOTE", "LINK", "LINK_KIND"]
+                "TOWARD", "CHECKS", "SCORE", "TIER", "MONEY", "NOTE", "FAIR_%", "VS_MKT_EV_%", "REF_BOOKS", "OFF_MARKET", "LINK", "LINK_KIND"]
 
 
 @dataclass(frozen=True)
@@ -90,12 +91,14 @@ def scan_board(games: Sequence[Mapping[str, Any]], league: str, split_rows: Sequ
                 o, r, sc = ev.outcome, ev.reading, ev.scored
                 line, price, name = o.get("point"), o.get("price"), o.get("name")
                 t, h = (r.ticket_pct, r.handle_pct) if r else (None, None)
+                off = market_edge.edge(g, market, name, line, price, preferred, now) if book.get("key") == preferred else \
+                    {"FAIR_%": None, "VS_MKT_EV_%": None, "REF_BOOKS": 0, "OFF_MARKET": False}
                 rec.append({"EVENT_ID": g["id"], "GAME": f"{g['away_team']} @ {g['home_team']}", "COMMENCE": g["commence_time"],
                             "WHEN": format_commence(g["commence_time"]), "MARKET": market, "SELECTION": name, "PICK": pick_label(market, name, line, price),
                             "LINE": line, "PRICE": price, "TICKETS_%": t, "HANDLE_%": h, "GAP": None if t is None else round(h - t, 1),
                             "BET_SIZE_X": None if sc.bet_size is None else round(min(sc.bet_size, 99.0), 1),
                             "TOWARD": None if sc.toward is None else round(sc.toward, 2), "CHECKS": f"{sc.points}/{TOTAL_CHECKS}", "SCORE": float(sc.points),
-                            "TIER": sc.tier, "MONEY": sc.money, "NOTE": _note(sc),
+                            "TIER": sc.tier, "MONEY": sc.money, "NOTE": _note(sc), **off,
                             "LINK": best_link(o, mk_info.get(market), book)[0], "LINK_KIND": best_link(o, mk_info.get(market), book)[1]})
     all_sides = pd.DataFrame(rec, columns=SIDE_COLUMNS)
     if all_sides.empty:
