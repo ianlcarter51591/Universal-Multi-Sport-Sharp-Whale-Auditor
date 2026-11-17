@@ -13,12 +13,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import pandas as pd
 import streamlit as st
 
-REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py", "parlay.py", "parlay_ui.py", "bet_links.py", "market_edge.py")
+REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py", "parlay.py", "parlay_ui.py", "bet_links.py", "market_edge.py", "row_click.py")
 _missing = [f for f in REQUIRED_FILES if not (Path(__file__).resolve().parent / f).exists()]
 if _missing:
     st.error("These files are missing from the app folder in GitHub: " + ", ".join(_missing) + ". Upload them next to this file and reboot the app.")
@@ -29,6 +29,7 @@ import cloud_store
 import persist
 import split_history as sh
 import market_edge
+import row_click
 import parlay_ui
 from auditor_core import (
     EVENT_ONLY_MARKETS,
@@ -321,7 +322,8 @@ def render_board(best: pd.DataFrame, split_status: str, split_rows: list, diag: 
     if view.empty and split_rows and not show.startswith("Off-market"):
         st.info("Nothing reaches LEAN right now. Choose Everything to see the full board.")
     cols = ["WHEN", "GAME", "MARKET", "PICK", "TICKETS_%", "HANDLE_%", "GAP", "BET_SIZE_X", "TOWARD", "CHECKS", "TIER", "FAIR_%", "VS_MKT_EV_%", "REF_BOOKS", "NOTE"]
-    st.dataframe(view[cols], use_container_width=True, hide_index=True)
+    payload = view.reset_index(drop=True)
+    row_click.clickable_table(st, payload[cols], payload, open_in_audit, "aud_board", use_container_width=True, hide_index=True)
     st.caption("How to read it: one row per game and market, showing the side with the money. CHECKS = how many of 5 yes/no checks are met: "
                "(1) money gap of 15+ points, (2) bigger bets, (3) the line moved toward the pick, (4) the signal held 30 minutes, (5) a market tell "
                "(reverse movement, an early / late move, or a key-number cross). LEAN = the money is on this side. SHARP = money, line move, "
@@ -338,12 +340,27 @@ def render_board(best: pd.DataFrame, split_status: str, split_rows: list, diag: 
                 st.table(coverage_report({n: (c.dk_label, c.dk_event_group) for n, c in SPORT_CONFIG.items()}, fetch=cached_dk_splits))
 
 
+def open_in_audit(row: Mapping[str, Any]) -> str:
+    """Click handler for Board / Signal log rows: remember the pick so the Audit tab selects its game, market and side."""
+    t = row_click.target_from_row(row)
+    if not t["event_id"] or not t["market"]:
+        raise RuntimeError("that row has no game or market.")
+    st.session_state["audit_target"] = t
+    return f"Opened {t['pick']} ({t['game']}) in the 🔍 Audit a game tab. Open that tab to see the full audit."
+
+
 def render_audit(league: str, games: list[dict[str, Any]], odds_key: str, split_rows: list, all_sides: pd.DataFrame,
                  history: pd.DataFrame, split_hist: pd.DataFrame, news_ids: list, manual: ManualInputs, now: pd.Timestamp) -> None:
     """One selection in detail."""
     cfg = SPORT_CONFIG[league]
-    game_idx = st.selectbox("Select Matchup to Audit", range(len(games)), format_func=lambda i: game_label(games[i]))
+    target = st.session_state.get("audit_target") or {}
+    ids = [str(g.get("id")) for g in games]
+    if target and target["event_id"] not in ids:
+        st.warning(f"{target['pick']} ({target['game']}) is no longer on this league's board (it may have started). Showing the first game instead.")
+    game_idx = st.selectbox("Select Matchup to Audit", range(len(games)), format_func=lambda i: game_label(games[i]),
+                            index=ids.index(target["event_id"]) if target.get("event_id") in ids else 0)
     game = games[game_idx]
+    on_target = bool(target) and str(game.get("id")) == target["event_id"]
     book = pick_bookmaker(game.get("bookmakers", []))
     if book is None:
         st.error("No active bookmaker odds available for this game.")
@@ -351,7 +368,8 @@ def render_audit(league: str, games: list[dict[str, Any]], odds_key: str, split_
     st.caption(f"Active Book Feed: **{book['title']}** | Last Updated: {book.get('last_update', 'N/A')}")
     market_dict = market_outcomes(book)
     markets = [m for m in FEATURED_MARKETS if m in market_dict] + list(EVENT_ONLY_MARKETS)
-    market = st.selectbox("Select Market Type", markets, format_func=market_label)
+    market = st.selectbox("Select Market Type", markets, format_func=market_label,
+                          index=markets.index(target["market"]) if on_target and target["market"] in markets else 0)
     if market in EVENT_ONLY_MARKETS:
         try:
             ev_books, _ = cached_event_market(cfg.api_key, game["id"], odds_key, market)
@@ -365,7 +383,8 @@ def render_audit(league: str, games: list[dict[str, Any]], odds_key: str, split_
             return
     else:
         outcomes = market_dict[market]
-    chosen_idx = st.selectbox("Select Specific Selection", range(len(outcomes)), format_func=lambda i: outcome_label(outcomes[i]))
+    pick_idx = row_click.outcome_index(outcomes, target["selection"], target["line"]) if on_target and market == target["market"] else 0
+    chosen_idx = st.selectbox("Select Specific Selection", range(len(outcomes)), format_func=lambda i: outcome_label(outcomes[i]), index=pick_idx)
     chosen = outcomes[chosen_idx]
     line, price, name = chosen.get("point"), chosen.get("price"), chosen["name"]
 
@@ -452,7 +471,8 @@ def render_log(league: str, odds_key: str, now: pd.Timestamp) -> None:
             store_signals(graded, force=True)
             st.success(f"Graded {n} pick(s).")
     if not signals.empty:
-        st.dataframe(signals.sort_values("FIRST_SEEN", ascending=False).head(200), use_container_width=True, hide_index=True)
+        recent_sig = signals.sort_values("FIRST_SEEN", ascending=False).head(200).reset_index(drop=True)
+        row_click.clickable_table(st, recent_sig, recent_sig, open_in_audit, "aud_log", use_container_width=True, hide_index=True)
         st.download_button("Download signal log (CSV)", signals.to_csv(index=False), file_name="auditor_signals.csv")
     st.caption("Picks are logged only while the app is open on a league, and the 'closing line' is the last line the app saw. "
                "Results come from The Odds API scores (finished games from the last 3 days only: grade often).")
