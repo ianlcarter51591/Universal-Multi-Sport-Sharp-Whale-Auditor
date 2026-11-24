@@ -21,7 +21,8 @@ from line_history import toward_move
 
 SIGNALS_NAME = "auditor_signals.csv"
 COLUMNS = ["SIGNAL_ID", "FIRST_SEEN", "LEAGUE", "EVENT_ID", "GAME", "COMMENCE", "MARKET", "SELECTION", "TIER", "SCORE", "TICKETS", "HANDLE",
-           "SIG_LINE", "SIG_PRICE", "LAST_TS", "LAST_LINE", "LAST_PRICE", "STATUS", "RESULT", "CLV", "OFF_EV", "OFF_MARKET"]
+           "SIG_LINE", "SIG_PRICE", "LAST_TS", "LAST_LINE", "LAST_PRICE", "STATUS", "RESULT", "CLV", "OFF_EV", "OFF_MARKET", "FLAGS", "LOGGED_BY"]
+CHECK_NAMES = ("1. Money gap", "2. Bigger bets", "3. Line moved", "4. Held 30 min", "5. Market tell")
 SIGNAL_TIERS = ("LEAN", "SHARP", "FILTERED")        # FILTERED picks are logged too, so the log can show whether the filters help
 REAL_TIERS = ("LEAN", "SHARP")
 MIN_GRADED = 50
@@ -54,7 +55,8 @@ def signal_id(event_id: Any, market: Any, selection: Any) -> str:
     return f"{event_id}|{market}|{selection}"
 
 
-def record(signals: pd.DataFrame, best: pd.DataFrame, league: str, now_iso: str, extra: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, int]:
+def record(signals: pd.DataFrame, best: pd.DataFrame, league: str, now_iso: str, extra: Optional[pd.DataFrame] = None,
+           logged_by: str = "app") -> Tuple[pd.DataFrame, int]:
     """Add LEAN / SHARP / FILTERED picks from a board scan that are not logged yet, plus any OFF_MARKET side in `extra` (all scanned sides) so the
     log can compare the two sources. A pending FILTERED pick that later becomes LEAN / SHARP is upgraded (its signal line and price become the ones
     at that moment); a pending off-market-only (PASS) pick that later becomes LEAN / SHARP only changes label and scores. (log, number added)."""
@@ -75,11 +77,12 @@ def record(signals: pd.DataFrame, best: pd.DataFrame, league: str, now_iso: str,
     if not up.empty:
         for i in log.index[log["SIGNAL_ID"].isin(up["_id"]) & ~log["TIER"].isin(REAL_TIERS + ("FILTERED",)) & log["STATUS"].eq("Pending")]:
             r = up[up["_id"] == log.at[i, "SIGNAL_ID"]].iloc[0]
-            log.loc[i, ["TIER", "SCORE", "TICKETS", "HANDLE"]] = [r["TIER"], r["SCORE"], r["TICKETS_%"], r["HANDLE_%"]]
+            log.loc[i, ["TIER", "SCORE", "TICKETS", "HANDLE", "FLAGS"]] = [r["TIER"], r["SCORE"], r["TICKETS_%"], r["HANDLE_%"], r.get("FLAGS", pd.NA)]
         idx = log.index[log["SIGNAL_ID"].isin(up["_id"]) & log["TIER"].eq("FILTERED") & log["STATUS"].eq("Pending")]
         for i in idx:
             r = up[up["_id"] == log.at[i, "SIGNAL_ID"]].iloc[0]
-            log.loc[i, ["TIER", "SCORE", "TICKETS", "HANDLE", "SIG_LINE", "SIG_PRICE", "FIRST_SEEN"]] = [r["TIER"], r["SCORE"], r["TICKETS_%"], r["HANDLE_%"], r["LINE"], r["PRICE"], now_iso]
+            log.loc[i, ["TIER", "SCORE", "TICKETS", "HANDLE", "SIG_LINE", "SIG_PRICE", "FIRST_SEEN", "FLAGS"]] = [
+                r["TIER"], r["SCORE"], r["TICKETS_%"], r["HANDLE_%"], r["LINE"], r["PRICE"], now_iso, r.get("FLAGS", pd.NA)]
     fresh = pick[~pick["_id"].isin(known)]
     if fresh.empty:
         return log, 0
@@ -92,7 +95,8 @@ def record(signals: pd.DataFrame, best: pd.DataFrame, league: str, now_iso: str,
         "LAST_TS": now_iso, "LAST_LINE": fresh["LINE"].to_numpy(), "LAST_PRICE": fresh["PRICE"].to_numpy(),
         "STATUS": "Pending", "RESULT": pd.NA, "CLV": np.nan,
         "OFF_EV": fresh["VS_MKT_EV_%"].to_numpy() if "VS_MKT_EV_%" in fresh.columns else np.nan,
-        "OFF_MARKET": np.where(fresh["OFF_MARKET"].fillna(False).astype(bool), "Y", "") if "OFF_MARKET" in fresh.columns else ""})
+        "OFF_MARKET": np.where(fresh["OFF_MARKET"].fillna(False).astype(bool), "Y", "") if "OFF_MARKET" in fresh.columns else "",
+        "FLAGS": fresh["FLAGS"].to_numpy() if "FLAGS" in fresh.columns else pd.NA, "LOGGED_BY": logged_by})
     return normalize(pd.concat([log, add], ignore_index=True)), len(add)
 
 
@@ -215,6 +219,70 @@ def source(log: pd.DataFrame) -> pd.Series:
     real = log["TIER"].isin(REAL_TIERS)
     return pd.Series(np.select([off & real, off & ~real, real, log["TIER"].eq("FILTERED")], ["Off-market + whale", "Off-market only", "Whale only", "Filtered"], "Other"),
                      index=log.index)
+
+
+def _profit(group: pd.DataFrame) -> Tuple[float, float]:
+    """(units won, ROI %) at 1 unit per graded pick at its signal price (pushes return the stake)."""
+    g = group[group["RESULT"].isin(["Hit", "Miss", "Push"])]
+    if g.empty:
+        return 0.0, np.nan
+    price = pd.to_numeric(g["SIG_PRICE"], errors="coerce").fillna(-110.0).to_numpy(float)
+    win = np.where(price > 0, price / 100.0, 100.0 / np.abs(np.where(price == 0, -100.0, price)))
+    units = np.where(g["RESULT"].eq("Hit"), win, np.where(g["RESULT"].eq("Miss"), -1.0, 0.0))
+    return float(units.sum()), 100.0 * float(units.sum()) / len(g)
+
+
+def by_check(signals: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each of the five checks: picks where it was Yes vs No (LEAN / SHARP / FILTERED with recorded flags), with hit %,
+    ROI at the signal price and beat-the-close %. A check that matters shows Yes clearly above No; one that doesn't is a
+    candidate to drop or down-weight. Picks logged before flags were recorded are left out.
+    """
+    log = normalize(signals)
+    cols = ["CHECK", "WHEN", "SIGNALS", "GRADED", "HIT_%", "LOW_%", "HIGH_%", "ROI_%", "BEAT_CLOSE_%", "CLV_COUNT"]
+    flags = log["FLAGS"].fillna("").astype(str)
+    log = log[flags.str.len().eq(len(CHECK_NAMES)) & log["TIER"].isin(SIGNAL_TIERS)]
+    rows: List[Dict[str, Any]] = []
+    for i, name in enumerate(CHECK_NAMES):
+        f = log["FLAGS"].astype(str).str[i]
+        for code, label in (("Y", "Yes"), ("N", "No")):
+            g = log[f.eq(code)]
+            if g.empty:
+                continue
+            rows.append({"CHECK": name, "WHEN": label, **_summarize(g), "ROI_%": _profit(g)[1]})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def by_score(signals: pd.DataFrame) -> pd.DataFrame:
+    """Results by checks met (2/5, 3/5, ...), with ROI at the signal price."""
+    log = normalize(signals)
+    log = log[log["TIER"].isin(SIGNAL_TIERS) & log["SCORE"].notna()]
+    cols = ["CHECKS_MET", "SIGNALS", "GRADED", "HIT_%", "LOW_%", "HIGH_%", "ROI_%", "BEAT_CLOSE_%", "CLV_COUNT"]
+    rows = [{"CHECKS_MET": f"{int(k)}/{len(CHECK_NAMES)}", **_summarize(g), "ROI_%": _profit(g)[1]} for k, g in log.groupby("SCORE")]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def pick_key(log: pd.DataFrame) -> pd.Series:
+    """Source-independent id of a pick (league, game day in ET, game, market, selection): the app and the collector use
+    different event ids for the same game."""
+    day = pd.to_datetime(log["COMMENCE"], utc=True, errors="coerce").dt.tz_convert("America/New_York").dt.strftime("%Y-%m-%d")
+    return (log["LEAGUE"].astype(str) + "|" + day.fillna("") + "|" + log["GAME"].astype(str) + "|" + log["MARKET"].astype(str)
+            + "|" + log["SELECTION"].astype(str))
+
+
+def merge_logs(app_log: pd.DataFrame, collector_log: pd.DataFrame) -> pd.DataFrame:
+    """One view of both logs: a pick logged by both keeps the graded copy, else the earliest sighting."""
+    a, c = normalize(app_log), normalize(collector_log)
+    a["LOGGED_BY"] = a["LOGGED_BY"].fillna("app")
+    c["LOGGED_BY"] = c["LOGGED_BY"].fillna("collector")
+    if c.empty:
+        return a
+    both = pd.concat([a, c], ignore_index=True)
+    both["_g"] = both["STATUS"].eq("Graded")
+    both["_t"] = pd.to_datetime(both["FIRST_SEEN"], utc=True, errors="coerce")
+    both["_k"] = pick_key(both)
+    both = both.sort_values(["_g", "_t"], ascending=[False, True]).drop_duplicates("_k", keep="first")
+    return normalize(both.drop(columns=["_g", "_t", "_k"]).sort_values("FIRST_SEEN"))
 
 
 def summary(signals: pd.DataFrame, by: str = "TIER") -> pd.DataFrame:
