@@ -20,7 +20,7 @@ from bet_links import best_link, market_map
 from split_history import persistence
 
 SIDE_COLUMNS = ["EVENT_ID", "GAME", "COMMENCE", "WHEN", "MARKET", "SELECTION", "PICK", "LINE", "PRICE", "TICKETS_%", "HANDLE_%", "GAP", "BET_SIZE_X",
-                "TOWARD", "CHECKS", "SCORE", "TIER", "MONEY", "NOTE", "FAIR_%", "VS_MKT_EV_%", "REF_BOOKS", "OFF_MARKET", "LINK", "LINK_KIND"]
+                "TOWARD", "CHECKS", "FLAGS", "SCORE", "TIER", "MONEY", "NOTE", "FAIR_%", "VS_MKT_EV_%", "REF_BOOKS", "OFF_MARKET", "LINK", "LINK_KIND"]
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,12 @@ def _note(sc: Scored) -> str:
     if sc.tier != "FILTERED" and sc.needs:
         return next((n for n in sc.notes if n.startswith("To become SHARP")), "")
     return sc.notes[0] if sc.notes else ""
+
+
+def check_flags(sc: Scored) -> str:
+    """The five checks as one string, e.g. 'YYN?N' (Y = yes, N = no, ? = not yet known), in checklist order."""
+    return "".join("Y" if str(r.get("Result", "")).endswith("Yes") else "N" if str(r.get("Result", "")).endswith("No") else "?"
+                   for r in sc.rows[:TOTAL_CHECKS])
 
 
 def pick_label(market: str, selection: str, line: Optional[float], price: Any) -> str:
@@ -97,7 +103,7 @@ def scan_board(games: Sequence[Mapping[str, Any]], league: str, split_rows: Sequ
                             "WHEN": format_commence(g["commence_time"]), "MARKET": market, "SELECTION": name, "PICK": pick_label(market, name, line, price),
                             "LINE": line, "PRICE": price, "TICKETS_%": t, "HANDLE_%": h, "GAP": None if t is None else round(h - t, 1),
                             "BET_SIZE_X": None if sc.bet_size is None else round(min(sc.bet_size, 99.0), 1),
-                            "TOWARD": None if sc.toward is None else round(sc.toward, 2), "CHECKS": f"{sc.points}/{TOTAL_CHECKS}", "SCORE": float(sc.points),
+                            "TOWARD": None if sc.toward is None else round(sc.toward, 2), "CHECKS": f"{sc.points}/{TOTAL_CHECKS}", "FLAGS": check_flags(sc), "SCORE": float(sc.points),
                             "TIER": sc.tier, "MONEY": sc.money, "NOTE": _note(sc), **off,
                             "LINK": best_link(o, mk_info.get(market), book)[0], "LINK_KIND": best_link(o, mk_info.get(market), book)[1]})
     all_sides = pd.DataFrame(rec, columns=SIDE_COLUMNS)
