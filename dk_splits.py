@@ -181,9 +181,20 @@ def _market_key(token: str) -> Optional[str]:
     return next((key for key, pat in _MARKET_PATTERNS if pat.match(text)), None)
 
 
-def _read_entries(section: list[str]) -> dict[str, list[tuple[str, float, float]]]:
-    """Read (selection, handle%, bets%) triples under each market heading."""
-    entries: dict[str, list[tuple[str, int, int]]] = {k: [] for k in _MARKET_KEYS}
+def _odds_value(text: str) -> Optional[int]:
+    """'-110' -> -110, '+145' -> 145, 'EVEN' -> 100."""
+    t = _norm_sign(text).upper()
+    if t in ("EVEN", "EV"):
+        return 100
+    try:
+        return int(t)
+    except ValueError:
+        return None
+
+
+def _read_entries(section: list[str]) -> dict[str, list[tuple[str, float, float, Optional[int]]]]:
+    """Read (selection, handle%, bets%, odds) under each market heading."""
+    entries: dict[str, list[tuple[str, float, float, Optional[int]]]] = {k: [] for k in _MARKET_KEYS}
     market: Optional[str] = None
     k = 0
     while k < len(section):
@@ -195,7 +206,7 @@ def _read_entries(section: list[str]) -> dict[str, list[tuple[str, float, float]
             odds = _norm_sign(section[k + 1])
             handle, bets = _PCT_RE.match(section[k + 2]), _PCT_RE.match(section[k + 3])
             if _ODDS_RE.match(odds) and handle and bets:
-                entries[market].append((section[k], float(handle[1]), float(bets[1])))
+                entries[market].append((section[k], float(handle[1]), float(bets[1]), _odds_value(odds)))
                 k += 4
                 continue
         k += 1
@@ -216,7 +227,7 @@ def _build_row(
     away_raw: str,
     home_raw: str,
     start_label: str,
-    entries: Mapping[str, list[tuple[str, float, float]]],
+    entries: Mapping[str, list[tuple[str, float, float, Optional[int]]]],
     updated: Optional[str],
     now: Optional[datetime],
 ) -> Optional[dict[str, Any]]:
@@ -237,7 +248,7 @@ def _build_row(
 
     for market in ("moneyline", "spread"):
         block: dict[str, Any] = {"bets_pct": {}, "handle_pct": {}}
-        for raw, handle, bets in entries[market]:
+        for raw, handle, bets, odds in entries[market]:
             name, line = raw, None
             if market == "spread":
                 m = _SPREAD_RE.match(raw)
@@ -251,17 +262,21 @@ def _build_row(
             block["bets_pct"][side] = bets / 100.0
             if line is not None:
                 block[f"{side}_line"] = line
+            if odds is not None:
+                block[f"{side}_odds"] = odds
         if block["handle_pct"]:
             row[market] = block
 
     total: dict[str, Any] = {"bets_pct": {}, "handle_pct": {}}
-    for raw, handle, bets in entries["total"]:
+    for raw, handle, bets, odds in entries["total"]:
         m = _TOTAL_RE.match(raw)
         if m:
             side = m[1].lower()
             total["handle_pct"][side] = handle / 100.0
             total["bets_pct"][side] = bets / 100.0
             total["line"] = float(m[2])
+            if odds is not None:
+                total[f"{side}_odds"] = odds
     if total["handle_pct"]:
         row["total"] = total
 
