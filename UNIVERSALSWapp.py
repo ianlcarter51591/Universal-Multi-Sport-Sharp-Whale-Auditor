@@ -18,7 +18,7 @@ from typing import Any, Mapping, Optional
 import pandas as pd
 import streamlit as st
 
-REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py", "parlay.py", "parlay_ui.py", "bet_links.py", "market_edge.py", "row_click.py")
+REQUIRED_FILES = ("auditor_core.py", "dk_splits.py", "cloud_store.py", "persist.py", "line_history.py", "scoring.py", "board_scan.py", "audit_log.py", "split_history.py", "parlay.py", "parlay_ui.py", "bet_links.py", "market_edge.py", "row_click.py", "collector.py")
 _missing = [f for f in REQUIRED_FILES if not (Path(__file__).resolve().parent / f).exists()]
 if _missing:
     st.error("These files are missing from the app folder in GitHub: " + ", ".join(_missing) + ". Upload them next to this file and reboot the app.")
@@ -26,6 +26,7 @@ if _missing:
 
 import audit_log
 import cloud_store
+import collector
 import persist
 import split_history as sh
 import market_edge
@@ -219,6 +220,8 @@ def render_sidebar() -> tuple[str, str, str, ManualInputs]:
                     help="One request for just these two books: about the same credits as the normal US pull, and Pinnacle (the sharpest price) is the reference. Other US books are not loaded. Games Pinnacle has not priced are skipped.")
         status = cloud_store.status()
         (st.caption if status["level"] == "ok" else st.warning)(("💾 " if status["level"] == "ok" else "⚠️ ") + status["text"])
+        level, text = collector.status_line(get_collector()["status"], pd.Timestamp.now(tz="UTC"))
+        (st.caption if level == "ok" else st.info if level == "none" else st.warning)(("🤖 " if level == "ok" else "⚠️ ") + text)
     return league, odds_key, override, ManualInputs(bool(use_splits), float(ticket_pct), float(handle_pct), bool(use_move), float(move))
 
 
@@ -260,6 +263,38 @@ def reading_for(rows: list[dict[str, Any]], game: dict[str, Any], market: str, s
 
 
 # --- Stored data ----------------------------------------------------------------
+COLLECTOR_REFRESH_MIN = 10.0
+
+
+def get_collector() -> dict:
+    """The background collector's files (re-read every COLLECTOR_REFRESH_MIN minutes). Read-only: the app never writes them."""
+    now = pd.Timestamp.now(tz="UTC")
+    cached = st.session_state.get("aud_collector")
+    if cached is None or (now - cached["_at"]).total_seconds() / 60.0 >= COLLECTOR_REFRESH_MIN:
+        try:
+            cached = {**collector.load_for_app(), "_at": now}
+        except Exception:
+            cached = {"history": pd.DataFrame(columns=HIST_COLUMNS), "splits": pd.DataFrame(columns=sh.COLUMNS),
+                      "signals": audit_log.empty(), "status": {}, "_at": now}
+        st.session_state["aud_collector"] = cached
+    return cached
+
+
+def with_collector(history: pd.DataFrame, split_hist: pd.DataFrame, games: list) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Line and split history for scoring: the app's own readings plus the collector's, matched to this league's games."""
+    col = get_collector()
+    ch = collector.remap_to_games(col["history"], games)
+    cs = collector.remap_to_games(col["splits"], games)
+    h = pd.concat([history, ch[HIST_COLUMNS]], ignore_index=True) if ch is not None and not ch.empty else history
+    s = pd.concat([split_hist, cs[sh.COLUMNS]], ignore_index=True) if cs is not None and not cs.empty else split_hist
+    return h, s
+
+
+def all_signals() -> pd.DataFrame:
+    """The app's signal log merged with the collector's (one row per pick)."""
+    col_sig = collector.remap_to_games(get_collector()["signals"], st.session_state.get("aud_games") or [])   # clicks open the right game
+    return audit_log.merge_logs(get_signals(), col_sig)
+
 def get_history() -> pd.DataFrame:
     """Saved line readings (loaded once per session)."""
     if "aud_history" not in st.session_state:
@@ -450,8 +485,10 @@ def render_audit(league: str, games: list[dict[str, Any]], odds_key: str, split_
 
 def render_log(league: str, odds_key: str, now: pd.Timestamp) -> None:
     """Signal log, validation tables and grading."""
-    signals = get_signals()
+    signals = all_signals()
     st.markdown("### 📒 Does the Auditor beat the market?")
+    n_col = int(signals["LOGGED_BY"].eq("collector").sum()) if not signals.empty else 0
+    st.caption(f"{len(signals)} picks: {len(signals) - n_col} logged by this app, {n_col} by the background collector.")
     for line in audit_log.verdict(signals):
         st.info(line)
     if not signals.empty:
@@ -461,21 +498,30 @@ def render_log(league: str, odds_key: str, now: pd.Timestamp) -> None:
         st.dataframe(audit_log.summary(signals, "SOURCE").round(1), use_container_width=True, hide_index=True)
         st.markdown("**By market**")
         st.dataframe(audit_log.summary(signals, "MARKET").round(1), use_container_width=True, hide_index=True)
-    if st.button(f"Grade finished {league} games (uses 2 Odds API credits)"):
-        try:
-            scores, _ = fetch_scores(SPORT_CONFIG[league].api_key, odds_key)
-        except OddsAPIError as exc:
-            st.error(str(exc))
-        else:
-            graded, n = audit_log.grade(signals, scores, now)
-            store_signals(graded, force=True)
-            st.success(f"Graded {n} pick(s).")
+        st.markdown("**By check** (which of the five checks pick winners: a useful check shows Yes clearly above No; "
+                    "trust it only after ~100 graded picks per row)")
+        st.dataframe(audit_log.by_check(signals).round(1), use_container_width=True, hide_index=True)
+        st.markdown("**By checks met**")
+        st.dataframe(audit_log.by_score(signals).round(1), use_container_width=True, hide_index=True)
+    if st.button("Grade finished games (free, from ESPN)"):
+        graded, n, err = collector.grade_free(get_signals(), now)
+        if err:
+            try:
+                scores, _ = fetch_scores(SPORT_CONFIG[league].api_key, odds_key)
+                graded, n2 = audit_log.grade(graded, scores, now)
+                n += n2
+                err += " (fell back to The Odds API scores for " + league + ": 2 credits)"
+            except OddsAPIError as exc:
+                err += f"; Odds API fallback failed: {exc}"
+            st.warning(err)
+        store_signals(graded, force=True)
+        st.success(f"Graded {n} pick(s).")
     if not signals.empty:
         recent_sig = signals.sort_values("FIRST_SEEN", ascending=False).head(200).reset_index(drop=True)
         row_click.clickable_table(st, recent_sig, recent_sig, open_in_audit, "aud_log", use_container_width=True, hide_index=True)
         st.download_button("Download signal log (CSV)", signals.to_csv(index=False), file_name="auditor_signals.csv")
-    st.caption("Picks are logged only while the app is open on a league, and the 'closing line' is the last line the app saw. "
-               "Results come from The Odds API scores (finished games from the last 3 days only: grade often).")
+    st.caption("This app logs picks while it is open; the background collector logs them every 30 minutes and grades them itself. "
+               "The 'closing line' is the last line seen before the start. FLAGS = the five checks in order (Y yes, N no, ? not yet known).")
 
 
 def main() -> None:
@@ -513,7 +559,9 @@ def main() -> None:
                                        help="Moves after news are everyone's money, not sharp money: marked games are filtered out.") or [])
     split_rows, split_status, diag = load_splits(league, override)
     split_hist = get_split_history()
-    best, all_sides = scan_board(games, league, split_rows, history, now, split_hist, news_ids)
+    st.session_state["aud_games"] = games
+    scan_hist, scan_splits = with_collector(history, split_hist, games)
+    best, all_sides = scan_board(games, league, split_rows, scan_hist, now, scan_splits, news_ids)
     split_hist, n_split = sh.append_new(split_hist, sh.rows_from_sides(all_sides, now.isoformat()))
     if n_split:
         store_split_history(sh.prune(split_hist, now))
@@ -528,7 +576,7 @@ def main() -> None:
     with tab_board:
         render_board(best, split_status, split_rows, diag, len(history), all_sides)
     with tab_audit:
-        render_audit(league, games, odds_key, split_rows, all_sides, history, split_hist, news_ids, manual, now)
+        render_audit(league, games, odds_key, split_rows, all_sides, scan_hist, scan_splits, news_ids, manual, now)
     with tab_parlay:
         parlay_ui.render_parlay(st, all_sides)
     with tab_log:
